@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -54,6 +55,9 @@ type exchangeLog struct {
 	ContentType     string            `json:"contentType,omitempty"`
 	UpstreamHeaders map[string]string `json:"upstreamHeaders,omitempty"`
 }
+
+// maxRequestBodySize 请求体最大允许大小（50MB），防止恶意或异常请求导致 OOM
+const maxRequestBodySize = 50 << 20
 
 func main() {
 	cfg, err := parseFlags()
@@ -207,7 +211,7 @@ func (s *proxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 
 	requestID := s.nextID.Add(1)
 	startedAt := time.Now()
-	requestBody, err := io.ReadAll(r.Body)
+	requestBody, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize))
 	if err != nil {
 		s.logExchange(exchangeLog{
 			RequestID:   requestID,
@@ -238,6 +242,8 @@ func (s *proxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
 		return
 	}
+	// 确保使用上游 URL 的 Host，而非客户端原始 Host
+	// （http.NewRequestWithContext 已自动设置，此行为防御性编码）
 	upstreamReq.Host = ""
 	copyRequestHeaders(upstreamReq.Header, r.Header)
 	upstreamReq.Header.Set("Authorization", "Bearer "+s.apiKey)
@@ -304,27 +310,53 @@ func (s *proxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// extractModelFromRequest 从请求body中提取模型名称，方便快速查看
-func extractModelFromRequest(body string) string {
-	var req struct {
-		Model string `json:"model"`
-	}
-	if err := json.Unmarshal([]byte(body), &req); err != nil {
-		return ""
-	}
-	return req.Model
+// chatRequest 用于一次性解析请求体中的 model 和 messages
+type chatRequest struct {
+	Model    string        `json:"model"`
+	Messages []chatMessage `json:"messages"`
 }
 
-// extractMessagesFromRequest 从请求body中提取对话消息，方便快速查看
-func extractMessagesFromRequest(body string) string {
-	var req struct {
-		Messages []struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-			Name    string `json:"name,omitempty"`
-		} `json:"messages"`
-	}
+// parseChatRequest 一次性解析请求体，避免多次 JSON 反序列化
+func parseChatRequest(body string) chatRequest {
+	var req chatRequest
 	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		return chatRequest{}
+	}
+	return req
+}
+
+// extractModelFromRequest 从请求body中提取模型名称，方便快速查看
+func extractModelFromRequest(body string) string {
+	return parseChatRequest(body).Model
+}
+
+// toolCallInfo 用于解析消息中的 tool_calls 字段
+type toolCallInfo struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// chatMessage 用于解析请求中的消息
+type chatMessage struct {
+	Role       string         `json:"role"`
+	Content    string         `json:"content"`
+	Name       string         `json:"name,omitempty"`
+	ToolCalls  []toolCallInfo `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+	// 兼容旧版 function_call
+	FunctionCall *struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function_call,omitempty"`
+}
+
+// extractMessagesFromRequest 从已解析的 chatRequest 中提取对话消息，方便快速查看
+func extractMessagesFromRequest(req chatRequest) string {
+	if len(req.Messages) == 0 {
 		return ""
 	}
 	var sb strings.Builder
@@ -350,14 +382,69 @@ func extractMessagesFromRequest(body string) string {
 
 		sb.WriteString(fmt.Sprintf("│ %s %-15s\n", icon, roleLabel))
 
-		// 格式化处理内容中的换行，增加缩进
-		lines := strings.Split(strings.TrimSpace(msg.Content), "\n")
-		for _, line := range lines {
-			if line == "" {
-				sb.WriteString("│\n")
-				continue
+		// 如果是 tool 消息，显示对应的 tool_call_id
+		if msg.ToolCallID != "" {
+			sb.WriteString(fmt.Sprintf("│   📎 tool_call_id: %s\n", msg.ToolCallID))
+			sb.WriteString("│\n")
+		}
+
+		// 如果是 assistant 消息且包含 tool_calls，显示工具调用信息
+		if len(msg.ToolCalls) > 0 {
+			for _, tc := range msg.ToolCalls {
+				sb.WriteString(fmt.Sprintf("│   🔧 Tool Call: %s (id: %s)\n", tc.Function.Name, tc.ID))
+				// 尝试格式化 arguments
+				var argsPretty string
+				var argsMap map[string]any
+				if err := json.Unmarshal([]byte(tc.Function.Arguments), &argsMap); err == nil {
+					if pretty, err := json.MarshalIndent(argsMap, "│     ", "  "); err == nil {
+						argsPretty = string(pretty)
+					}
+				}
+				if argsPretty == "" {
+					argsPretty = tc.Function.Arguments
+				}
+				for _, line := range strings.Split(argsPretty, "\n") {
+					sb.WriteString(fmt.Sprintf("│     %s\n", line))
+				}
 			}
-			sb.WriteString(fmt.Sprintf("│   %s\n", line))
+			// 如果同时有 content，也显示
+			if strings.TrimSpace(msg.Content) != "" {
+				sb.WriteString("│\n")
+				sb.WriteString("│   📝 Content:\n")
+				for _, line := range strings.Split(strings.TrimSpace(msg.Content), "\n") {
+					if line == "" {
+						sb.WriteString("│\n")
+						continue
+					}
+					sb.WriteString(fmt.Sprintf("│     %s\n", line))
+				}
+			}
+		} else if msg.FunctionCall != nil {
+			// 兼容旧版 function_call
+			sb.WriteString(fmt.Sprintf("│   🔧 Function Call: %s\n", msg.FunctionCall.Name))
+			var argsPretty string
+			var argsMap map[string]any
+			if err := json.Unmarshal([]byte(msg.FunctionCall.Arguments), &argsMap); err == nil {
+				if pretty, err := json.MarshalIndent(argsMap, "│     ", "  "); err == nil {
+					argsPretty = string(pretty)
+				}
+			}
+			if argsPretty == "" {
+				argsPretty = msg.FunctionCall.Arguments
+			}
+			for _, line := range strings.Split(argsPretty, "\n") {
+				sb.WriteString(fmt.Sprintf("│     %s\n", line))
+			}
+		} else {
+			// 普通消息，格式化处理内容中的换行，增加缩进
+			lines := strings.Split(strings.TrimSpace(msg.Content), "\n")
+			for _, line := range lines {
+				if line == "" {
+					sb.WriteString("│\n")
+					continue
+				}
+				sb.WriteString(fmt.Sprintf("│   %s\n", line))
+			}
 		}
 
 		if i < len(req.Messages)-1 {
@@ -368,76 +455,251 @@ func extractMessagesFromRequest(body string) string {
 	return sb.String()
 }
 
-// extractResponseContent 从响应body中提取模型返回的内容，方便快速查看
-func extractResponseContent(body string) string {
-	var content string
+// responseInfo 保存从响应中提取的结构化信息
+type responseInfo struct {
+	Content      string // 模型返回的文本内容
+	ToolCalls    []toolCallInfo
+	FinishReason string
+	Usage        *usageInfo
+	RawContent   string // 原始响应文本（用于保存到文件）
+}
+
+type usageInfo struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+// extractResponseInfo 从响应body中提取模型返回的完整信息，包括工具调用、token用量等
+func extractResponseInfo(body string) responseInfo {
+	info := responseInfo{RawContent: body}
+
 	// 处理流式响应的情况
 	if strings.HasPrefix(body, "data: ") {
-		var sb strings.Builder
-		lines := strings.Split(body, "\n")
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line == "" || line == "data: [DONE]" {
-				continue
-			}
-			if strings.HasPrefix(line, "data: ") {
-				jsonStr := strings.TrimPrefix(line, "data: ")
-				var resp struct {
-					Choices []struct {
-						Delta struct {
-							Content string `json:"content"`
-						} `json:"delta"`
-					} `json:"choices"`
-				}
-				if err := json.Unmarshal([]byte(jsonStr), &resp); err == nil && len(resp.Choices) > 0 {
-					sb.WriteString(resp.Choices[0].Delta.Content)
-				}
-			}
-		}
-		content = sb.String()
+		info.extractFromStream(body)
 	} else {
-		// 处理普通响应
-		var resp struct {
-			Choices []struct {
-				Message struct {
-					Content string `json:"content"`
-				} `json:"message"`
-			} `json:"choices"`
+		info.extractFromNonStream(body)
+	}
+
+	return info
+}
+
+// streamToolCallDelta 用于流式响应中解析 delta.tool_calls，包含 index 字段
+type streamToolCallDelta struct {
+	Index   int    `json:"index"`
+	ID      string `json:"id"`
+	Type    string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// extractFromStream 从 SSE 流式响应中提取信息
+func (info *responseInfo) extractFromStream(body string) {
+	var contentBuilder strings.Builder
+	var toolCalls []toolCallInfo
+	var finishReason string
+	var lastUsage *usageInfo
+
+	lines := strings.Split(body, "\n")
+	// 用于合并流式 tool_calls 的临时结构
+	streamToolCalls := make(map[int]*toolCallInfo)
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "data: [DONE]" {
+			continue
 		}
-		if err := json.Unmarshal([]byte(body), &resp); err == nil && len(resp.Choices) > 0 {
-			content = resp.Choices[0].Message.Content
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		jsonStr := strings.TrimPrefix(line, "data: ")
+
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content   string               `json:"content"`
+					ToolCalls []streamToolCallDelta `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason string `json:"finish_reason"`
+			} `json:"choices"`
+			Usage *usageInfo `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(jsonStr), &chunk); err != nil {
+			continue
+		}
+
+		if len(chunk.Choices) > 0 {
+			choice := chunk.Choices[0]
+			if choice.Delta.Content != "" {
+				contentBuilder.WriteString(choice.Delta.Content)
+			}
+			// 合并流式 tool_calls（每个 chunk 只包含部分信息）
+			for _, tc := range choice.Delta.ToolCalls {
+				idx := tc.Index
+				if existing, exists := streamToolCalls[idx]; exists {
+					// 合并：更新 ID、name、追加 arguments
+					if tc.ID != "" {
+						existing.ID = tc.ID
+					}
+					if tc.Type != "" {
+						existing.Type = tc.Type
+					}
+					if tc.Function.Name != "" {
+						existing.Function.Name += tc.Function.Name
+					}
+					if tc.Function.Arguments != "" {
+						existing.Function.Arguments += tc.Function.Arguments
+					}
+				} else {
+					streamToolCalls[idx] = &toolCallInfo{
+						ID:   tc.ID,
+						Type: tc.Type,
+						Function: struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						}{
+							Name:      tc.Function.Name,
+							Arguments: tc.Function.Arguments,
+						},
+					}
+				}
+			}
+			if choice.FinishReason != "" {
+				finishReason = choice.FinishReason
+			}
+		}
+		if chunk.Usage != nil {
+			lastUsage = chunk.Usage
 		}
 	}
 
-	if content == "" {
+	info.Content = contentBuilder.String()
+	// 将 map 转为 slice（按 key 排序）
+	if len(streamToolCalls) > 0 {
+		indices := make([]int, 0, len(streamToolCalls))
+		for k := range streamToolCalls {
+			indices = append(indices, k)
+		}
+		sort.Ints(indices)
+		for _, k := range indices {
+			toolCalls = append(toolCalls, *streamToolCalls[k])
+		}
+	}
+	info.ToolCalls = toolCalls
+	info.FinishReason = finishReason
+	info.Usage = lastUsage
+}
+
+// extractFromNonStream 从普通（非流式）响应中提取信息
+func (info *responseInfo) extractFromNonStream(body string) {
+	var resp struct {
+		Choices []struct {
+			Message struct {
+				Content   string         `json:"content"`
+				ToolCalls []toolCallInfo `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage *usageInfo `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		return
+	}
+	if len(resp.Choices) > 0 {
+		info.Content = resp.Choices[0].Message.Content
+		info.ToolCalls = resp.Choices[0].Message.ToolCalls
+		info.FinishReason = resp.Choices[0].FinishReason
+	}
+	info.Usage = resp.Usage
+}
+
+// formatResponseContent 格式化响应内容为可读文本
+func formatResponseContent(info responseInfo) string {
+	if info.Content == "" && len(info.ToolCalls) == 0 && info.Usage == nil {
 		return ""
 	}
 
-	// 美化格式输出
 	var sb strings.Builder
 	sb.WriteString("┌──────────────────────────────────────────────────────────────────────────────────────────────────\n")
 	sb.WriteString("│ 🤖 ASSISTANT RESPONSE\n")
 	sb.WriteString("├──────────────────────────────────────────────────────────────────────────────────────────────────\n")
 
-	lines := strings.Split(strings.TrimSpace(content), "\n")
-	for _, line := range lines {
-		if line == "" {
-			sb.WriteString("│\n")
-			continue
+	// 文本内容
+	if info.Content != "" {
+		lines := strings.Split(strings.TrimSpace(info.Content), "\n")
+		for _, line := range lines {
+			if line == "" {
+				sb.WriteString("│\n")
+				continue
+			}
+			sb.WriteString(fmt.Sprintf("│   %s\n", line))
 		}
-		sb.WriteString(fmt.Sprintf("│   %s\n", line))
 	}
+
+	// 工具调用
+	if len(info.ToolCalls) > 0 {
+		if info.Content != "" {
+			sb.WriteString("│\n")
+		}
+		sb.WriteString("│   🔧 TOOL CALLS:\n")
+		sb.WriteString("│\n")
+		for i, tc := range info.ToolCalls {
+			sb.WriteString(fmt.Sprintf("│   ┌─ Tool Call #%d ─────────────────────────────────────────────────────────────────────────────\n", i+1))
+			sb.WriteString(fmt.Sprintf("│   │ ID:       %s\n", tc.ID))
+			sb.WriteString(fmt.Sprintf("│   │ Type:     %s\n", tc.Type))
+			sb.WriteString(fmt.Sprintf("│   │ Function: %s\n", tc.Function.Name))
+			// 格式化 arguments
+			var argsPretty string
+			var argsMap map[string]any
+			if err := json.Unmarshal([]byte(tc.Function.Arguments), &argsMap); err == nil {
+				if pretty, err := json.MarshalIndent(argsMap, "│   │ Args:     ", "  "); err == nil {
+					argsPretty = string(pretty)
+				}
+			}
+			if argsPretty == "" {
+				argsPretty = tc.Function.Arguments
+			}
+			if argsPretty != "" {
+				sb.WriteString("│   │ Args:\n")
+				for _, line := range strings.Split(argsPretty, "\n") {
+					sb.WriteString(fmt.Sprintf("│   │   %s\n", line))
+				}
+			}
+			sb.WriteString("│   └────────────────────────────────────────────────────────────────────────────────────────────\n")
+		}
+	}
+
+	// Finish Reason
+	if info.FinishReason != "" {
+		sb.WriteString("│\n")
+		sb.WriteString(fmt.Sprintf("│   🏁 Finish Reason: %s\n", info.FinishReason))
+	}
+
+	// Token 用量
+	if info.Usage != nil {
+		sb.WriteString("│\n")
+		sb.WriteString("│   📊 Token Usage:\n")
+		sb.WriteString(fmt.Sprintf("│      Prompt Tokens:     %d\n", info.Usage.PromptTokens))
+		sb.WriteString(fmt.Sprintf("│      Completion Tokens: %d\n", info.Usage.CompletionTokens))
+		sb.WriteString(fmt.Sprintf("│      Total Tokens:      %d\n", info.Usage.TotalTokens))
+	}
+
 	sb.WriteString("└──────────────────────────────────────────────────────────────────────────────────────────────────")
 	return sb.String()
 }
 
 func (s *proxyServer) logExchange(entry exchangeLog) {
-	// 提取模型名称
-	model := extractModelFromRequest(entry.RequestBody)
+	// 一次性解析请求体，避免多次 JSON 反序列化
+	chatReq := parseChatRequest(entry.RequestBody)
+	model := chatReq.Model
 	// 提取对话消息
-	messages := extractMessagesFromRequest(entry.RequestBody)
-	// 提取响应内容
-	responseContent := extractResponseContent(entry.ResponseBody)
+	messages := extractMessagesFromRequest(chatReq)
+	// 提取响应信息（包括工具调用、token用量等）
+	responseInfo := extractResponseInfo(entry.ResponseBody)
+	// 格式化响应内容
+	responseContent := formatResponseContent(responseInfo)
 
 	// 基本信息放在最前面
 	attrs := []any{
@@ -459,7 +721,7 @@ func (s *proxyServer) logExchange(entry exchangeLog) {
 
 	// 将消息保存到单独的文件中
 	if s.msgDir != "" {
-		s.saveMessageToFile(entry.RequestID, model, messages, responseContent)
+		s.saveMessageToFile(entry.RequestID, model, messages, responseContent, responseInfo)
 	}
 
 	// 详细信息放在最后
@@ -483,7 +745,7 @@ func (s *proxyServer) logExchange(entry exchangeLog) {
 	s.logger.Info("✅ 请求成功", attrs...)
 }
 
-func (s *proxyServer) saveMessageToFile(reqID uint64, model, messages, response string) {
+func (s *proxyServer) saveMessageToFile(reqID uint64, model, messages, response string, respInfo responseInfo) {
 	timestamp := time.Now().Format("20060102_150405")
 	filename := fmt.Sprintf("%s_%04d.txt", timestamp, reqID)
 	filePath := filepath.Join(s.msgDir, filename)
@@ -493,6 +755,19 @@ func (s *proxyServer) saveMessageToFile(reqID uint64, model, messages, response 
 	content.WriteString(fmt.Sprintf("║ 🆔 Request ID: %d\n", reqID))
 	content.WriteString(fmt.Sprintf("║ ⏰ Timestamp:  %s\n", time.Now().Format(time.RFC3339)))
 	content.WriteString(fmt.Sprintf("║ 🧠 Model:      %s\n", model))
+	if respInfo.FinishReason != "" {
+		content.WriteString(fmt.Sprintf("║ 🏁 Finish:     %s\n", respInfo.FinishReason))
+	}
+	if respInfo.Usage != nil {
+		content.WriteString(fmt.Sprintf("║ 📊 Tokens:     prompt=%d, completion=%d, total=%d\n",
+			respInfo.Usage.PromptTokens, respInfo.Usage.CompletionTokens, respInfo.Usage.TotalTokens))
+	}
+	if len(respInfo.ToolCalls) > 0 {
+		content.WriteString(fmt.Sprintf("║ 🔧 Tool Calls: %d\n", len(respInfo.ToolCalls)))
+		for i, tc := range respInfo.ToolCalls {
+			content.WriteString(fmt.Sprintf("║    #%d %s (id: %s)\n", i+1, tc.Function.Name, tc.ID))
+		}
+	}
 	content.WriteString("╚══════════════════════════════════════════════════════════════════════════════════════════════════\n\n")
 
 	if messages != "" {
