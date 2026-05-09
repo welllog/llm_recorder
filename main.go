@@ -310,10 +310,25 @@ func (s *proxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// chatRequest 用于一次性解析请求体中的 model 和 messages
+// chatRequest 用于一次性解析请求体中的 model、messages、tools 等
 type chatRequest struct {
-	Model    string        `json:"model"`
-	Messages []chatMessage `json:"messages"`
+	Model      string        `json:"model"`
+	Messages   []chatMessage `json:"messages"`
+	Tools      []toolDef     `json:"tools,omitempty"`
+	ToolChoice any           `json:"tool_choice,omitempty"`
+}
+
+// toolDef 描述请求中传递给模型的工具定义
+type toolDef struct {
+	Type     string      `json:"type"`
+	Function toolFuncDef `json:"function"`
+}
+
+// toolFuncDef 描述工具函数的名称、描述和参数 schema
+type toolFuncDef struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Parameters  any    `json:"parameters,omitempty"`
 }
 
 // parseChatRequest 一次性解析请求体，避免多次 JSON 反序列化
@@ -323,11 +338,6 @@ func parseChatRequest(body string) chatRequest {
 		return chatRequest{}
 	}
 	return req
-}
-
-// extractModelFromRequest 从请求body中提取模型名称，方便快速查看
-func extractModelFromRequest(body string) string {
-	return parseChatRequest(body).Model
 }
 
 // toolCallInfo 用于解析消息中的 tool_calls 字段
@@ -455,6 +465,62 @@ func extractMessagesFromRequest(req chatRequest) string {
 	return sb.String()
 }
 
+// extractToolsFromRequest 从已解析的 chatRequest 中提取工具定义信息
+func extractToolsFromRequest(req chatRequest) string {
+	if len(req.Tools) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("┌──────────────────────────────────────────────────────────────────────────────────────────────────\n")
+	sb.WriteString("│ 🔧 TOOL DEFINITIONS\n")
+	sb.WriteString("├──────────────────────────────────────────────────────────────────────────────────────────────────\n")
+
+	for i, tool := range req.Tools {
+		sb.WriteString(fmt.Sprintf("│ 📌 Tool #%d: %s (type: %s)\n", i+1, tool.Function.Name, tool.Type))
+		if tool.Function.Description != "" {
+			// 将描述按行输出，增加缩进
+			descLines := strings.Split(strings.TrimSpace(tool.Function.Description), "\n")
+			sb.WriteString("│   📝 Description:\n")
+			for _, line := range descLines {
+				sb.WriteString(fmt.Sprintf("│     %s\n", line))
+			}
+		}
+		if tool.Function.Parameters != nil {
+			sb.WriteString("│   📋 Parameters:\n")
+			var paramsPretty string
+			if pretty, err := json.MarshalIndent(tool.Function.Parameters, "│     ", "  "); err == nil {
+				paramsPretty = string(pretty)
+			}
+			if paramsPretty != "" {
+				for _, line := range strings.Split(paramsPretty, "\n") {
+					sb.WriteString(fmt.Sprintf("│     %s\n", line))
+				}
+			}
+		}
+		if i < len(req.Tools)-1 {
+			sb.WriteString("│\n")
+		}
+	}
+
+	// 显示 tool_choice（如果有）
+	if req.ToolChoice != nil {
+		sb.WriteString("│\n")
+		sb.WriteString("│ 🎯 Tool Choice:\n")
+		var tcPretty string
+		if pretty, err := json.MarshalIndent(req.ToolChoice, "│   ", "  "); err == nil {
+			tcPretty = string(pretty)
+		}
+		if tcPretty != "" {
+			for _, line := range strings.Split(tcPretty, "\n") {
+				sb.WriteString(fmt.Sprintf("│   %s\n", line))
+			}
+		}
+	}
+
+	sb.WriteString("└──────────────────────────────────────────────────────────────────────────────────────────────────")
+	return sb.String()
+}
+
 // responseInfo 保存从响应中提取的结构化信息
 type responseInfo struct {
 	Content      string // 模型返回的文本内容
@@ -486,9 +552,9 @@ func extractResponseInfo(body string) responseInfo {
 
 // streamToolCallDelta 用于流式响应中解析 delta.tool_calls，包含 index 字段
 type streamToolCallDelta struct {
-	Index   int    `json:"index"`
-	ID      string `json:"id"`
-	Type    string `json:"type"`
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
+	Type     string `json:"type"`
 	Function struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
@@ -519,7 +585,7 @@ func (info *responseInfo) extractFromStream(body string) {
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Content   string               `json:"content"`
+					Content   string                `json:"content"`
 					ToolCalls []streamToolCallDelta `json:"tool_calls"`
 				} `json:"delta"`
 				FinishReason string `json:"finish_reason"`
@@ -696,6 +762,8 @@ func (s *proxyServer) logExchange(entry exchangeLog) {
 	model := chatReq.Model
 	// 提取对话消息
 	messages := extractMessagesFromRequest(chatReq)
+	// 提取工具定义
+	tools := extractToolsFromRequest(chatReq)
 	// 提取响应信息（包括工具调用、token用量等）
 	responseInfo := extractResponseInfo(entry.ResponseBody)
 	// 格式化响应内容
@@ -711,6 +779,10 @@ func (s *proxyServer) logExchange(entry exchangeLog) {
 	}
 
 	// 核心内容放在中间，最容易看到
+	if tools != "" {
+		attrs = append(attrs, slog.String("tools", tools))
+	}
+
 	if messages != "" {
 		attrs = append(attrs, slog.String("messages", messages))
 	}
@@ -721,7 +793,7 @@ func (s *proxyServer) logExchange(entry exchangeLog) {
 
 	// 将消息保存到单独的文件中
 	if s.msgDir != "" {
-		s.saveMessageToFile(entry.RequestID, model, messages, responseContent, responseInfo)
+		s.saveMessageToFile(entry.RequestID, model, chatReq, tools, messages, responseContent, responseInfo)
 	}
 
 	// 详细信息放在最后
@@ -745,7 +817,7 @@ func (s *proxyServer) logExchange(entry exchangeLog) {
 	s.logger.Info("✅ 请求成功", attrs...)
 }
 
-func (s *proxyServer) saveMessageToFile(reqID uint64, model, messages, response string, respInfo responseInfo) {
+func (s *proxyServer) saveMessageToFile(reqID uint64, model string, chatReq chatRequest, tools, messages, response string, respInfo responseInfo) {
 	timestamp := time.Now().Format("20060102_150405")
 	filename := fmt.Sprintf("%s_%04d.txt", timestamp, reqID)
 	filePath := filepath.Join(s.msgDir, filename)
@@ -768,7 +840,18 @@ func (s *proxyServer) saveMessageToFile(reqID uint64, model, messages, response 
 			content.WriteString(fmt.Sprintf("║    #%d %s (id: %s)\n", i+1, tc.Function.Name, tc.ID))
 		}
 	}
+	if len(chatReq.Tools) > 0 {
+		content.WriteString(fmt.Sprintf("║ 🛠️  Tools:      %d defined\n", len(chatReq.Tools)))
+		for i, tool := range chatReq.Tools {
+			content.WriteString(fmt.Sprintf("║    #%d %s\n", i+1, tool.Function.Name))
+		}
+	}
 	content.WriteString("╚══════════════════════════════════════════════════════════════════════════════════════════════════\n\n")
+
+	if tools != "" {
+		content.WriteString(tools)
+		content.WriteString("\n\n")
+	}
 
 	if messages != "" {
 		content.WriteString(messages)
