@@ -2,3 +2,4 @@ start.sh
 messages
 *.log
 messages*
+prompt_*.md

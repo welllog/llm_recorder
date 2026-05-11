@@ -23,26 +23,34 @@ import (
 )
 
 type proxyConfig struct {
-	listenAddr      string
-	upstreamBaseURL string
-	apiKey          string
-	logFile         string
-	logFormat       string
-	msgDir          string
-	timeout         time.Duration
+	listenAddr       string
+	openaiUpstreamBaseURL    string
+	openaiAPIKey             string
+	anthropicUpstreamBaseURL string
+	anthropicAPIKey          string
+	logFile          string
+	logFormat        string
+	msgDir           string
+	timeout          time.Duration
+}
+
+type upstreamTarget struct {
+	provider    string
+	upstreamURL string
+	apiKey      string
 }
 
 type proxyServer struct {
-	client          *http.Client
-	upstreamChatURL string
-	apiKey          string
-	logger          *slog.Logger
-	msgDir          string
-	nextID          atomic.Uint64
+	client           *http.Client
+	routeTargets     map[string]upstreamTarget
+	logger           *slog.Logger
+	msgDir           string
+	nextID           atomic.Uint64
 }
 
 type exchangeLog struct {
 	RequestID       uint64            `json:"requestId"`
+	Provider        string            `json:"provider"`
 	Method          string            `json:"method"`
 	Path            string            `json:"path"`
 	RemoteAddr      string            `json:"remoteAddr"`
@@ -58,6 +66,11 @@ type exchangeLog struct {
 
 // maxRequestBodySize 请求体最大允许大小（50MB），防止恶意或异常请求导致 OOM
 const maxRequestBodySize = 50 << 20
+
+const (
+	providerOpenAI    = "openai"
+	providerAnthropic = "anthropic"
+)
 
 func main() {
 	cfg, err := parseFlags()
@@ -83,9 +96,15 @@ func main() {
 	}
 	slog.SetDefault(logger)
 
-	upstreamChatURL, err := buildUpstreamChatURL(cfg.upstreamBaseURL)
+	openaiUpstreamURL, err := buildUpstreamURL(cfg.openaiUpstreamBaseURL, providerOpenAI)
 	if err != nil {
-		logger.Error("invalid upstream base url", "error", err)
+		logger.Error("invalid openai upstream base url", "error", err)
+		os.Exit(1)
+	}
+
+	anthropicUpstreamURL, err := buildUpstreamURL(cfg.anthropicUpstreamBaseURL, providerAnthropic)
+	if err != nil {
+		logger.Error("invalid anthropic upstream base url", "error", err)
 		os.Exit(1)
 	}
 
@@ -102,10 +121,20 @@ func main() {
 				DisableCompression:  true,
 			},
 		},
-		upstreamChatURL: upstreamChatURL,
-		apiKey:          cfg.apiKey,
-		logger:          logger,
-		msgDir:          cfg.msgDir,
+		routeTargets: map[string]upstreamTarget{
+			"/v1/chat/completions": {
+				provider:    providerOpenAI,
+				upstreamURL: openaiUpstreamURL,
+				apiKey:      cfg.openaiAPIKey,
+			},
+			"/v1/messages": {
+				provider:    providerAnthropic,
+				upstreamURL: anthropicUpstreamURL,
+				apiKey:      cfg.anthropicAPIKey,
+			},
+		},
+		logger: logger,
+		msgDir:  cfg.msgDir,
 	}
 
 	if cfg.msgDir != "" {
@@ -115,11 +144,7 @@ func main() {
 		}
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", server.handleChatCompletions)
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		http.NotFound(w, r)
-	})
+	mux := newProxyMux(server)
 
 	httpServer := &http.Server{
 		Addr:              cfg.listenAddr,
@@ -139,7 +164,13 @@ func main() {
 		}
 	}()
 
-	logger.Info("proxy server starting", "listenAddr", cfg.listenAddr, "upstreamChatURL", upstreamChatURL, "logFile", cfg.logFile)
+	logger.Info(
+		"proxy server starting",
+		"listenAddr", cfg.listenAddr,
+		"openaiUpstreamURL", openaiUpstreamURL,
+		"anthropicUpstreamURL", anthropicUpstreamURL,
+		"logFile", cfg.logFile,
+	)
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("server stopped with error", "error", err)
 		os.Exit(1)
@@ -149,8 +180,10 @@ func main() {
 func parseFlags() (proxyConfig, error) {
 	var cfg proxyConfig
 	flag.StringVar(&cfg.listenAddr, "listen", ":8080", "listen address for the proxy server")
-	flag.StringVar(&cfg.upstreamBaseURL, "upstream-base-url", "", "OpenAI-compatible upstream base URL, e.g. https://api.example.com/v1")
-	flag.StringVar(&cfg.apiKey, "api-key", "", "upstream API key")
+	flag.StringVar(&cfg.openaiUpstreamBaseURL, "openai-upstream-base-url", "", "OpenAI upstream base URL, e.g. https://api.openai.com/v1")
+	flag.StringVar(&cfg.openaiAPIKey, "openai-api-key", "", "OpenAI upstream API key")
+	flag.StringVar(&cfg.anthropicUpstreamBaseURL, "anthropic-upstream-base-url", "", "Anthropic upstream base URL, e.g. https://api.anthropic.com")
+	flag.StringVar(&cfg.anthropicAPIKey, "anthropic-api-key", "", "Anthropic upstream API key")
 	flag.StringVar(&cfg.logFile, "log-file", "llm_proxy.log", "log file path in the current directory")
 	flag.StringVar(&cfg.logFormat, "log-format", "text", "log format: text (human-readable) or json")
 	flag.StringVar(&cfg.msgDir, "msg-dir", "messages", "directory to store structured message text files (empty to disable)")
@@ -158,8 +191,10 @@ func parseFlags() (proxyConfig, error) {
 	flag.Parse()
 
 	cfg.listenAddr = strings.TrimSpace(cfg.listenAddr)
-	cfg.upstreamBaseURL = strings.TrimSpace(cfg.upstreamBaseURL)
-	cfg.apiKey = strings.TrimSpace(cfg.apiKey)
+	cfg.openaiUpstreamBaseURL = strings.TrimSpace(cfg.openaiUpstreamBaseURL)
+	cfg.openaiAPIKey = strings.TrimSpace(cfg.openaiAPIKey)
+	cfg.anthropicUpstreamBaseURL = strings.TrimSpace(cfg.anthropicUpstreamBaseURL)
+	cfg.anthropicAPIKey = strings.TrimSpace(cfg.anthropicAPIKey)
 	cfg.logFile = strings.TrimSpace(cfg.logFile)
 	cfg.logFormat = strings.ToLower(strings.TrimSpace(cfg.logFormat))
 	cfg.msgDir = strings.TrimSpace(cfg.msgDir)
@@ -167,11 +202,17 @@ func parseFlags() (proxyConfig, error) {
 	if cfg.listenAddr == "" {
 		cfg.listenAddr = ":8080"
 	}
-	if cfg.upstreamBaseURL == "" {
-		return proxyConfig{}, fmt.Errorf("missing required flag: --upstream-base-url")
+	if cfg.openaiUpstreamBaseURL == "" {
+		return proxyConfig{}, fmt.Errorf("missing required flag: --openai-upstream-base-url")
 	}
-	if cfg.apiKey == "" {
-		return proxyConfig{}, fmt.Errorf("missing required flag: --api-key")
+	if cfg.openaiAPIKey == "" {
+		return proxyConfig{}, fmt.Errorf("missing required flag: --openai-api-key")
+	}
+	if cfg.anthropicUpstreamBaseURL == "" {
+		return proxyConfig{}, fmt.Errorf("missing required flag: --anthropic-upstream-base-url")
+	}
+	if cfg.anthropicAPIKey == "" {
+		return proxyConfig{}, fmt.Errorf("missing required flag: --anthropic-api-key")
 	}
 	if cfg.logFile == "" {
 		cfg.logFile = "llm_proxy.log"
@@ -186,26 +227,53 @@ func parseFlags() (proxyConfig, error) {
 	return cfg, nil
 }
 
-func buildUpstreamChatURL(baseURL string) (string, error) {
+func buildUpstreamURL(baseURL, provider string) (string, error) {
 	trimmed := strings.TrimSpace(baseURL)
 	if trimmed == "" {
 		return "", fmt.Errorf("empty upstream base url")
 	}
-	joined, err := url.JoinPath(trimmed, "chat/completions")
+	path := "chat/completions"
+	if provider == providerAnthropic {
+		path = "v1/messages"
+	}
+	joined, err := url.JoinPath(trimmed, path)
 	if err != nil {
 		return "", err
 	}
 	return joined, nil
 }
 
+func newProxyMux(server *proxyServer) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/chat/completions", server.handleChatCompletions)
+	mux.HandleFunc("/v1/messages", server.handleMessages)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+	return mux
+}
+
 func (s *proxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/v1/chat/completions" {
+	s.handleProxyRequest(w, r, "/v1/chat/completions")
+}
+
+func (s *proxyServer) handleMessages(w http.ResponseWriter, r *http.Request) {
+	s.handleProxyRequest(w, r, "/v1/messages")
+}
+
+func (s *proxyServer) handleProxyRequest(w http.ResponseWriter, r *http.Request, expectedPath string) {
+	if r.URL.Path != expectedPath {
 		http.NotFound(w, r)
 		return
 	}
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+		return
+	}
+	target, ok := s.routeTargets[expectedPath]
+	if !ok {
+		http.Error(w, "route target not configured", http.StatusInternalServerError)
 		return
 	}
 
@@ -215,30 +283,32 @@ func (s *proxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		s.logExchange(exchangeLog{
 			RequestID:   requestID,
+			Provider:    target.provider,
 			Method:      r.Method,
 			Path:        r.URL.Path,
 			RemoteAddr:  r.RemoteAddr,
-			UpstreamURL: s.upstreamChatURL,
+			UpstreamURL: target.upstreamURL,
 			Duration:    time.Since(startedAt),
 			Error:       fmt.Sprintf("read request body: %v", err),
-		})
+		}, target.provider)
 		http.Error(w, "failed to read request body", http.StatusBadRequest)
 		return
 	}
 	_ = r.Body.Close()
 
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, s.upstreamChatURL, bytes.NewReader(requestBody))
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target.upstreamURL, bytes.NewReader(requestBody))
 	if err != nil {
 		s.logExchange(exchangeLog{
 			RequestID:   requestID,
+			Provider:    target.provider,
 			Method:      r.Method,
 			Path:        r.URL.Path,
 			RemoteAddr:  r.RemoteAddr,
-			UpstreamURL: s.upstreamChatURL,
+			UpstreamURL: target.upstreamURL,
 			Duration:    time.Since(startedAt),
 			RequestBody: string(requestBody),
 			Error:       fmt.Sprintf("create upstream request: %v", err),
-		})
+		}, target.provider)
 		http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
 		return
 	}
@@ -246,7 +316,13 @@ func (s *proxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	// （http.NewRequestWithContext 已自动设置，此行为防御性编码）
 	upstreamReq.Host = ""
 	copyRequestHeaders(upstreamReq.Header, r.Header)
-	upstreamReq.Header.Set("Authorization", "Bearer "+s.apiKey)
+	if target.provider == providerAnthropic {
+		upstreamReq.Header.Set("X-Api-Key", target.apiKey)
+		upstreamReq.Header.Del("Authorization")
+	} else {
+		upstreamReq.Header.Del("X-Api-Key")
+		upstreamReq.Header.Set("Authorization", "Bearer "+target.apiKey)
+	}
 	if upstreamReq.Header.Get("Content-Type") == "" {
 		upstreamReq.Header.Set("Content-Type", "application/json")
 	}
@@ -256,14 +332,15 @@ func (s *proxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		s.logExchange(exchangeLog{
 			RequestID:   requestID,
+			Provider:    target.provider,
 			Method:      r.Method,
 			Path:        r.URL.Path,
 			RemoteAddr:  r.RemoteAddr,
-			UpstreamURL: s.upstreamChatURL,
+			UpstreamURL: target.upstreamURL,
 			Duration:    time.Since(startedAt),
 			RequestBody: string(requestBody),
 			Error:       fmt.Sprintf("call upstream: %v", err),
-		})
+		}, target.provider)
 		http.Error(w, "failed to call upstream", http.StatusBadGateway)
 		return
 	}
@@ -280,10 +357,11 @@ func (s *proxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	if copyErr != nil && !errors.Is(copyErr, context.Canceled) {
 		s.logExchange(exchangeLog{
 			RequestID:       requestID,
+			Provider:        target.provider,
 			Method:          r.Method,
 			Path:            r.URL.Path,
 			RemoteAddr:      r.RemoteAddr,
-			UpstreamURL:     s.upstreamChatURL,
+			UpstreamURL:     target.upstreamURL,
 			StatusCode:      upstreamResp.StatusCode,
 			Duration:        time.Since(startedAt),
 			RequestBody:     string(requestBody),
@@ -291,23 +369,24 @@ func (s *proxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 			Error:           fmt.Sprintf("copy upstream response: %v", copyErr),
 			ContentType:     upstreamResp.Header.Get("Content-Type"),
 			UpstreamHeaders: selectedHeaders(upstreamResp.Header),
-		})
+		}, target.provider)
 		return
 	}
 
 	s.logExchange(exchangeLog{
 		RequestID:       requestID,
+		Provider:        target.provider,
 		Method:          r.Method,
 		Path:            r.URL.Path,
 		RemoteAddr:      r.RemoteAddr,
-		UpstreamURL:     s.upstreamChatURL,
+		UpstreamURL:     target.upstreamURL,
 		StatusCode:      upstreamResp.StatusCode,
 		Duration:        time.Since(startedAt),
 		RequestBody:     string(requestBody),
 		ResponseBody:    responseBuffer.String(),
 		ContentType:     upstreamResp.Header.Get("Content-Type"),
 		UpstreamHeaders: selectedHeaders(upstreamResp.Header),
-	})
+	}, target.provider)
 }
 
 // chatRequest 用于一次性解析请求体中的 model、messages、tools 等
@@ -521,6 +600,170 @@ func extractToolsFromRequest(req chatRequest) string {
 	return sb.String()
 }
 
+type anthropicRequest struct {
+	Model    string             `json:"model"`
+	System   json.RawMessage    `json:"system,omitempty"`
+	Messages []anthropicMessage `json:"messages"`
+	Tools    []anthropicTool    `json:"tools,omitempty"`
+}
+
+type anthropicMessage struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+type anthropicTool struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	InputSchema any    `json:"input_schema,omitempty"`
+}
+
+type anthropicContentBlock struct {
+	Type      string          `json:"type"`
+	Text      string          `json:"text,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Input     json.RawMessage `json:"input,omitempty"`
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+}
+
+func parseAnthropicRequest(body string) anthropicRequest {
+	var req anthropicRequest
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		return anthropicRequest{}
+	}
+	return req
+}
+
+func formatAnthropicContent(raw json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return ""
+	}
+
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return text
+	}
+
+	var blocks []anthropicContentBlock
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return trimmed
+	}
+
+	var lines []string
+	for _, block := range blocks {
+		switch block.Type {
+		case "text":
+			if strings.TrimSpace(block.Text) != "" {
+				lines = append(lines, block.Text)
+			}
+		case "tool_use":
+			args := strings.TrimSpace(string(block.Input))
+			if args == "" {
+				args = "{}"
+			}
+			lines = append(lines, fmt.Sprintf("[tool_use] %s (id: %s)", block.Name, block.ID))
+			lines = append(lines, args)
+		case "tool_result":
+			result := formatAnthropicContent(block.Content)
+			if result == "" {
+				result = strings.TrimSpace(string(block.Content))
+			}
+			lines = append(lines, fmt.Sprintf("[tool_result] tool_use_id=%s", block.ToolUseID))
+			if result != "" {
+				lines = append(lines, result)
+			}
+		default:
+			lines = append(lines, fmt.Sprintf("[%s] %s", block.Type, strings.TrimSpace(string(block.Content))))
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func extractMessagesFromAnthropicRequest(req anthropicRequest) string {
+	if len(req.Messages) == 0 && len(req.System) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("┌──────────────────────────────────────────────────────────────────────────────────────────────────\n")
+	sb.WriteString("│ 💬 PROMPT DETAILS\n")
+	sb.WriteString("├──────────────────────────────────────────────────────────────────────────────────────────────────\n")
+
+	if len(req.System) > 0 {
+		systemText := formatAnthropicContent(req.System)
+		if systemText != "" {
+			sb.WriteString("│ ⚙️  SYSTEM\n")
+			for _, line := range strings.Split(systemText, "\n") {
+				if strings.TrimSpace(line) == "" {
+					sb.WriteString("│\n")
+					continue
+				}
+				sb.WriteString(fmt.Sprintf("│   %s\n", line))
+			}
+			if len(req.Messages) > 0 {
+				sb.WriteString("│\n")
+			}
+		}
+	}
+
+	for i, msg := range req.Messages {
+		sb.WriteString(fmt.Sprintf("│ 👤 %-15s\n", strings.ToUpper(msg.Role)))
+		content := formatAnthropicContent(msg.Content)
+		for _, line := range strings.Split(content, "\n") {
+			if strings.TrimSpace(line) == "" {
+				sb.WriteString("│\n")
+				continue
+			}
+			sb.WriteString(fmt.Sprintf("│   %s\n", line))
+		}
+		if i < len(req.Messages)-1 {
+			sb.WriteString("│\n")
+		}
+	}
+
+	sb.WriteString("└──────────────────────────────────────────────────────────────────────────────────────────────────")
+	return sb.String()
+}
+
+func extractToolsFromAnthropicRequest(req anthropicRequest) string {
+	if len(req.Tools) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("┌──────────────────────────────────────────────────────────────────────────────────────────────────\n")
+	sb.WriteString("│ 🔧 TOOL DEFINITIONS\n")
+	sb.WriteString("├──────────────────────────────────────────────────────────────────────────────────────────────────\n")
+
+	for i, tool := range req.Tools {
+		sb.WriteString(fmt.Sprintf("│ 📌 Tool #%d: %s\n", i+1, tool.Name))
+		if tool.Description != "" {
+			sb.WriteString("│   📝 Description:\n")
+			for _, line := range strings.Split(strings.TrimSpace(tool.Description), "\n") {
+				sb.WriteString(fmt.Sprintf("│     %s\n", line))
+			}
+		}
+		if tool.InputSchema != nil {
+			sb.WriteString("│   📋 Input Schema:\n")
+			if pretty, err := json.MarshalIndent(tool.InputSchema, "│     ", "  "); err == nil {
+				for _, line := range strings.Split(string(pretty), "\n") {
+					sb.WriteString(fmt.Sprintf("│     %s\n", line))
+				}
+			}
+		}
+		if i < len(req.Tools)-1 {
+			sb.WriteString("│\n")
+		}
+	}
+
+	sb.WriteString("└──────────────────────────────────────────────────────────────────────────────────────────────────")
+	return sb.String()
+}
+
 // responseInfo 保存从响应中提取的结构化信息
 type responseInfo struct {
 	Content      string // 模型返回的文本内容
@@ -537,14 +780,23 @@ type usageInfo struct {
 }
 
 // extractResponseInfo 从响应body中提取模型返回的完整信息，包括工具调用、token用量等
-func extractResponseInfo(body string) responseInfo {
+func extractResponseInfo(body, provider string) responseInfo {
 	info := responseInfo{RawContent: body}
 
-	// 处理流式响应的情况
+	if provider == providerAnthropic {
+		if strings.Contains(body, "\nevent:") || strings.HasPrefix(strings.TrimSpace(body), "event:") {
+			info.extractAnthropicFromStream(body)
+		} else {
+			info.extractAnthropicFromNonStream(body)
+		}
+		return info
+	}
+
+	// OpenAI 流式响应
 	if strings.HasPrefix(body, "data: ") {
-		info.extractFromStream(body)
+		info.extractOpenAIFromStream(body)
 	} else {
-		info.extractFromNonStream(body)
+		info.extractOpenAIFromNonStream(body)
 	}
 
 	return info
@@ -562,7 +814,7 @@ type streamToolCallDelta struct {
 }
 
 // extractFromStream 从 SSE 流式响应中提取信息
-func (info *responseInfo) extractFromStream(body string) {
+func (info *responseInfo) extractOpenAIFromStream(body string) {
 	var contentBuilder strings.Builder
 	var toolCalls []toolCallInfo
 	var finishReason string
@@ -659,7 +911,7 @@ func (info *responseInfo) extractFromStream(body string) {
 }
 
 // extractFromNonStream 从普通（非流式）响应中提取信息
-func (info *responseInfo) extractFromNonStream(body string) {
+func (info *responseInfo) extractOpenAIFromNonStream(body string) {
 	var resp struct {
 		Choices []struct {
 			Message struct {
@@ -679,6 +931,163 @@ func (info *responseInfo) extractFromNonStream(body string) {
 		info.FinishReason = resp.Choices[0].FinishReason
 	}
 	info.Usage = resp.Usage
+}
+
+func (info *responseInfo) extractAnthropicFromNonStream(body string) {
+	var resp struct {
+		Content    []anthropicContentBlock `json:"content"`
+		StopReason string                  `json:"stop_reason"`
+		Usage      *struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		return
+	}
+
+	var contentBuilder strings.Builder
+	for _, block := range resp.Content {
+		switch block.Type {
+		case "text":
+			contentBuilder.WriteString(block.Text)
+		case "tool_use":
+			tool := toolCallInfo{ID: block.ID, Type: block.Type}
+			tool.Function.Name = block.Name
+			tool.Function.Arguments = strings.TrimSpace(string(block.Input))
+			info.ToolCalls = append(info.ToolCalls, tool)
+		}
+	}
+
+	info.Content = contentBuilder.String()
+	info.FinishReason = resp.StopReason
+	if resp.Usage != nil {
+		info.Usage = &usageInfo{
+			PromptTokens:     resp.Usage.InputTokens,
+			CompletionTokens: resp.Usage.OutputTokens,
+			TotalTokens:      resp.Usage.InputTokens + resp.Usage.OutputTokens,
+		}
+	}
+}
+
+func (info *responseInfo) extractAnthropicFromStream(body string) {
+	var contentBuilder strings.Builder
+	streamToolCalls := make(map[int]*toolCallInfo)
+	toolCallHasDelta := make(map[int]bool)
+	var finishReason string
+	var usage *usageInfo
+	currentEvent := ""
+
+	lines := strings.Split(body, "\n")
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			currentEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+
+		switch currentEvent {
+		case "message_start":
+			var event struct {
+				Message struct {
+					Usage struct {
+						InputTokens int `json:"input_tokens"`
+					} `json:"usage"`
+				} `json:"message"`
+			}
+			if err := json.Unmarshal([]byte(data), &event); err == nil {
+				usage = &usageInfo{PromptTokens: event.Message.Usage.InputTokens}
+			}
+		case "content_block_start":
+			var event struct {
+				Index        int                   `json:"index"`
+				ContentBlock anthropicContentBlock `json:"content_block"`
+			}
+			if err := json.Unmarshal([]byte(data), &event); err != nil {
+				continue
+			}
+			if event.ContentBlock.Type == "text" {
+				contentBuilder.WriteString(event.ContentBlock.Text)
+				continue
+			}
+			if event.ContentBlock.Type == "tool_use" {
+				tool := &toolCallInfo{ID: event.ContentBlock.ID, Type: event.ContentBlock.Type}
+				tool.Function.Name = event.ContentBlock.Name
+				tool.Function.Arguments = strings.TrimSpace(string(event.ContentBlock.Input))
+				streamToolCalls[event.Index] = tool
+			}
+		case "content_block_delta":
+			var event struct {
+				Index int `json:"index"`
+				Delta struct {
+					Type        string `json:"type"`
+					Text        string `json:"text"`
+					PartialJSON string `json:"partial_json"`
+				} `json:"delta"`
+			}
+			if err := json.Unmarshal([]byte(data), &event); err != nil {
+				continue
+			}
+			switch event.Delta.Type {
+			case "text_delta":
+				contentBuilder.WriteString(event.Delta.Text)
+			case "input_json_delta":
+				if _, ok := streamToolCalls[event.Index]; !ok {
+					streamToolCalls[event.Index] = &toolCallInfo{Type: "tool_use"}
+				}
+				if !toolCallHasDelta[event.Index] {
+					streamToolCalls[event.Index].Function.Arguments = ""
+					toolCallHasDelta[event.Index] = true
+				}
+				streamToolCalls[event.Index].Function.Arguments += event.Delta.PartialJSON
+			}
+		case "message_delta":
+			var event struct {
+				Delta struct {
+					StopReason string `json:"stop_reason"`
+				} `json:"delta"`
+				Usage struct {
+					OutputTokens int `json:"output_tokens"`
+				} `json:"usage"`
+			}
+			if err := json.Unmarshal([]byte(data), &event); err != nil {
+				continue
+			}
+			if event.Delta.StopReason != "" {
+				finishReason = event.Delta.StopReason
+			}
+			if usage == nil {
+				usage = &usageInfo{}
+			}
+			usage.CompletionTokens = event.Usage.OutputTokens
+			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+		}
+	}
+
+	info.Content = contentBuilder.String()
+	if len(streamToolCalls) > 0 {
+		indices := make([]int, 0, len(streamToolCalls))
+		for idx := range streamToolCalls {
+			indices = append(indices, idx)
+		}
+		sort.Ints(indices)
+		for _, idx := range indices {
+			info.ToolCalls = append(info.ToolCalls, *streamToolCalls[idx])
+		}
+	}
+	info.FinishReason = finishReason
+	info.Usage = usage
 }
 
 // formatResponseContent 格式化响应内容为可读文本
@@ -756,22 +1165,17 @@ func formatResponseContent(info responseInfo) string {
 	return sb.String()
 }
 
-func (s *proxyServer) logExchange(entry exchangeLog) {
-	// 一次性解析请求体，避免多次 JSON 反序列化
-	chatReq := parseChatRequest(entry.RequestBody)
-	model := chatReq.Model
-	// 提取对话消息
-	messages := extractMessagesFromRequest(chatReq)
-	// 提取工具定义
-	tools := extractToolsFromRequest(chatReq)
+func (s *proxyServer) logExchange(entry exchangeLog, provider string) {
+	model, messages, tools, toolCount := extractRequestInfo(entry.RequestBody, provider)
 	// 提取响应信息（包括工具调用、token用量等）
-	responseInfo := extractResponseInfo(entry.ResponseBody)
+	responseInfo := extractResponseInfo(entry.ResponseBody, provider)
 	// 格式化响应内容
 	responseContent := formatResponseContent(responseInfo)
 
 	// 基本信息放在最前面
 	attrs := []any{
 		slog.Uint64("requestId", entry.RequestID),
+		slog.String("provider", provider),
 		slog.Int("statusCode", entry.StatusCode),
 		slog.String("model", model),
 		slog.Duration("duration", entry.Duration),
@@ -793,7 +1197,7 @@ func (s *proxyServer) logExchange(entry exchangeLog) {
 
 	// 将消息保存到单独的文件中
 	if s.msgDir != "" {
-		s.saveMessageToFile(entry.RequestID, model, chatReq, tools, messages, responseContent, responseInfo)
+		s.saveMessageToFile(entry.RequestID, provider, entry.Path, model, toolCount, tools, messages, responseContent, responseInfo)
 	}
 
 	// 详细信息放在最后
@@ -817,15 +1221,27 @@ func (s *proxyServer) logExchange(entry exchangeLog) {
 	s.logger.Info("✅ 请求成功", attrs...)
 }
 
-func (s *proxyServer) saveMessageToFile(reqID uint64, model string, chatReq chatRequest, tools, messages, response string, respInfo responseInfo) {
+func extractRequestInfo(body, provider string) (model, messages, tools string, toolCount int) {
+	if provider == providerAnthropic {
+		req := parseAnthropicRequest(body)
+		return req.Model, extractMessagesFromAnthropicRequest(req), extractToolsFromAnthropicRequest(req), len(req.Tools)
+	}
+
+	req := parseChatRequest(body)
+	return req.Model, extractMessagesFromRequest(req), extractToolsFromRequest(req), len(req.Tools)
+}
+
+func (s *proxyServer) saveMessageToFile(reqID uint64, provider, requestPath, model string, toolCount int, tools, messages, response string, respInfo responseInfo) {
 	timestamp := time.Now().Format("20060102_150405")
-	filename := fmt.Sprintf("%s_%04d.txt", timestamp, reqID)
+	filename := fmt.Sprintf("%s_%s_%04d.txt", timestamp, provider, reqID)
 	filePath := filepath.Join(s.msgDir, filename)
 
 	var content strings.Builder
 	content.WriteString("╔══════════════════════════════════════════════════════════════════════════════════════════════════\n")
 	content.WriteString(fmt.Sprintf("║ 🆔 Request ID: %d\n", reqID))
 	content.WriteString(fmt.Sprintf("║ ⏰ Timestamp:  %s\n", time.Now().Format(time.RFC3339)))
+	content.WriteString(fmt.Sprintf("║ 🧭 Provider:   %s\n", provider))
+	content.WriteString(fmt.Sprintf("║ 🛣️  Path:       %s\n", requestPath))
 	content.WriteString(fmt.Sprintf("║ 🧠 Model:      %s\n", model))
 	if respInfo.FinishReason != "" {
 		content.WriteString(fmt.Sprintf("║ 🏁 Finish:     %s\n", respInfo.FinishReason))
@@ -840,11 +1256,8 @@ func (s *proxyServer) saveMessageToFile(reqID uint64, model string, chatReq chat
 			content.WriteString(fmt.Sprintf("║    #%d %s (id: %s)\n", i+1, tc.Function.Name, tc.ID))
 		}
 	}
-	if len(chatReq.Tools) > 0 {
-		content.WriteString(fmt.Sprintf("║ 🛠️  Tools:      %d defined\n", len(chatReq.Tools)))
-		for i, tool := range chatReq.Tools {
-			content.WriteString(fmt.Sprintf("║    #%d %s\n", i+1, tool.Function.Name))
-		}
+	if toolCount > 0 {
+		content.WriteString(fmt.Sprintf("║ 🛠️  Tools:      %d defined\n", toolCount))
 	}
 	content.WriteString("╚══════════════════════════════════════════════════════════════════════════════════════════════════\n\n")
 
