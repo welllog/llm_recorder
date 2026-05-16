@@ -469,6 +469,90 @@ func TestExtractResponseInfoAnthropicStream(t *testing.T) {
 	}
 }
 
+func TestExtractResponseInfoOpenAINonStream(t *testing.T) {
+	body := `{"choices":[{"index":0,"message":{"content":"","reasoning_content":"step one","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"alpha\"}"}}]},"finish_reason":"tool_calls"},{"index":1,"message":{"content":"final answer","reasoning_content":"step two"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}`
+	info := extractResponseInfo(body, providerOpenAI)
+
+	if info.Content != "final answer" {
+		t.Fatalf("unexpected content: %q", info.Content)
+	}
+	if info.ReasoningContent != "step one\nstep two" {
+		t.Fatalf("unexpected reasoning content: %q", info.ReasoningContent)
+	}
+	if info.FinishReason != "stop" {
+		t.Fatalf("unexpected finish reason: %s", info.FinishReason)
+	}
+	if info.Usage == nil || info.Usage.PromptTokens != 5 || info.Usage.CompletionTokens != 7 || info.Usage.TotalTokens != 12 {
+		t.Fatalf("unexpected usage: %+v", info.Usage)
+	}
+	if len(info.ToolCalls) != 1 || info.ToolCalls[0].Function.Name != "lookup" {
+		t.Fatalf("unexpected tool calls: %+v", info.ToolCalls)
+	}
+}
+
+func TestExtractResponseInfoOpenAIStream(t *testing.T) {
+	body := strings.Join([]string{
+		"  data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"think\"}}]}",
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}",
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"alpha\\\"}\"}}]}}]}",
+		"data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}]}",
+		"data: [DONE]",
+	}, "\n")
+
+	info := extractResponseInfo(body, providerOpenAI)
+	if info.Content != "Hello" {
+		t.Fatalf("unexpected content: %q", info.Content)
+	}
+	if info.ReasoningContent != "think" {
+		t.Fatalf("unexpected reasoning content: %q", info.ReasoningContent)
+	}
+	if info.FinishReason != "stop" {
+		t.Fatalf("unexpected finish reason: %s", info.FinishReason)
+	}
+	if len(info.ToolCalls) != 1 || info.ToolCalls[0].Function.Name != "lookup" {
+		t.Fatalf("unexpected tool calls: %+v", info.ToolCalls)
+	}
+}
+
+func TestExtractResponseInfoAnthropicStreamThinking(t *testing.T) {
+	body := strings.Join([]string{
+		"event: message_start",
+		"data: {\"message\":{\"usage\":{\"input_tokens\":3}}}",
+		"",
+		"event: content_block_start",
+		"data: {\"index\":0,\"content_block\":{\"type\":\"thinking\"}}",
+		"",
+		"event: content_block_delta",
+		"data: {\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"First thought\"}}",
+		"",
+		"event: content_block_start",
+		"data: {\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\"}}",
+		"",
+		"event: content_block_start",
+		"data: {\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"Answer\"}}",
+		"",
+		"event: message_delta",
+		"data: {\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}",
+	}, "\n")
+
+	info := extractResponseInfo(body, providerAnthropic)
+	if info.Content != "Answer" {
+		t.Fatalf("unexpected content: %q", info.Content)
+	}
+	if !strings.Contains(info.ReasoningContent, "First thought") {
+		t.Fatalf("unexpected reasoning content: %q", info.ReasoningContent)
+	}
+	if !strings.Contains(info.ReasoningContent, "加密的思考过程") {
+		t.Fatalf("expected redacted thinking marker, got: %q", info.ReasoningContent)
+	}
+	if info.FinishReason != "end_turn" {
+		t.Fatalf("unexpected finish reason: %s", info.FinishReason)
+	}
+	if info.Usage == nil || info.Usage.PromptTokens != 3 || info.Usage.CompletionTokens != 2 || info.Usage.TotalTokens != 5 {
+		t.Fatalf("unexpected usage: %+v", info.Usage)
+	}
+}
+
 type countingReadCloser struct {
 	io.ReadCloser
 	closeCalls int

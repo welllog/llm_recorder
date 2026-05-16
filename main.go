@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 type proxyConfig struct {
@@ -998,12 +999,36 @@ type usageInfo struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
+type openAIChoiceState struct {
+	Content      strings.Builder
+	Reasoning    strings.Builder
+	FinishReason string
+	ToolCalls    map[int]*toolCallInfo
+}
+
+func appendTextSegment(builder *strings.Builder, segment string) {
+	if segment == "" {
+		return
+	}
+	if builder.Len() > 0 {
+		builder.WriteString("\n")
+	}
+	builder.WriteString(segment)
+}
+
+func trimLeadingNoise(s string) string {
+	return strings.TrimLeftFunc(s, func(r rune) bool {
+		return unicode.IsSpace(r) || r == '\ufeff'
+	})
+}
+
 // extractResponseInfo 从响应body中提取模型返回的完整信息，包括工具调用、token用量等
 func extractResponseInfo(body, provider string) responseInfo {
 	info := responseInfo{RawContent: body}
 
 	if provider == providerAnthropic {
-		if strings.Contains(body, "\nevent:") || strings.HasPrefix(strings.TrimSpace(body), "event:") {
+		trimmed := trimLeadingNoise(body)
+		if strings.Contains(body, "\nevent:") || strings.HasPrefix(trimmed, "event:") {
 			info.extractAnthropicFromStream(body)
 		} else {
 			info.extractAnthropicFromNonStream(body)
@@ -1012,7 +1037,7 @@ func extractResponseInfo(body, provider string) responseInfo {
 	}
 
 	// OpenAI 流式响应
-	if strings.HasPrefix(body, "data: ") {
+	if strings.HasPrefix(trimLeadingNoise(body), "data: ") {
 		info.extractOpenAIFromStream(body)
 	} else {
 		info.extractOpenAIFromNonStream(body)
@@ -1034,14 +1059,12 @@ type streamToolCallDelta struct {
 
 // extractFromStream 从 SSE 流式响应中提取信息
 func (info *responseInfo) extractOpenAIFromStream(body string) {
-	var contentBuilder strings.Builder
-	var toolCalls []toolCallInfo
-	var finishReason string
+	contentBuilder := strings.Builder{}
+	reasoningBuilder := strings.Builder{}
 	var lastUsage *usageInfo
 
 	lines := strings.Split(body, "\n")
-	// 用于合并流式 tool_calls 的临时结构
-	streamToolCalls := make(map[int]*toolCallInfo)
+	choiceStates := make(map[int]*openAIChoiceState)
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -1055,9 +1078,12 @@ func (info *responseInfo) extractOpenAIFromStream(body string) {
 
 		var chunk struct {
 			Choices []struct {
+				Index int `json:"index"`
 				Delta struct {
-					Content   string                `json:"content"`
-					ToolCalls []streamToolCallDelta `json:"tool_calls"`
+					Content          string                `json:"content"`
+					ReasoningContent string                `json:"reasoning_content"`
+					Reasoning        string                `json:"reasoning"`
+					ToolCalls        []streamToolCallDelta `json:"tool_calls"`
 				} `json:"delta"`
 				FinishReason string `json:"finish_reason"`
 			} `json:"choices"`
@@ -1067,15 +1093,28 @@ func (info *responseInfo) extractOpenAIFromStream(body string) {
 			continue
 		}
 
-		if len(chunk.Choices) > 0 {
-			choice := chunk.Choices[0]
+		if chunk.Usage != nil {
+			lastUsage = chunk.Usage
+		}
+
+		for _, choice := range chunk.Choices {
+			state, ok := choiceStates[choice.Index]
+			if !ok {
+				state = &openAIChoiceState{ToolCalls: make(map[int]*toolCallInfo)}
+				choiceStates[choice.Index] = state
+			}
 			if choice.Delta.Content != "" {
-				contentBuilder.WriteString(choice.Delta.Content)
+				state.Content.WriteString(choice.Delta.Content)
+			}
+			if choice.Delta.ReasoningContent != "" {
+				state.Reasoning.WriteString(choice.Delta.ReasoningContent)
+			} else if choice.Delta.Reasoning != "" {
+				state.Reasoning.WriteString(choice.Delta.Reasoning)
 			}
 			// 合并流式 tool_calls（每个 chunk 只包含部分信息）
 			for _, tc := range choice.Delta.ToolCalls {
 				idx := tc.Index
-				if existing, exists := streamToolCalls[idx]; exists {
+				if existing, exists := state.ToolCalls[idx]; exists {
 					// 合并：更新 ID、name、追加 arguments
 					if tc.ID != "" {
 						existing.ID = tc.ID
@@ -1090,7 +1129,7 @@ func (info *responseInfo) extractOpenAIFromStream(body string) {
 						existing.Function.Arguments += tc.Function.Arguments
 					}
 				} else {
-					streamToolCalls[idx] = &toolCallInfo{
+					state.ToolCalls[idx] = &toolCallInfo{
 						ID:   tc.ID,
 						Type: tc.Type,
 						Function: struct {
@@ -1104,28 +1143,38 @@ func (info *responseInfo) extractOpenAIFromStream(body string) {
 				}
 			}
 			if choice.FinishReason != "" {
-				finishReason = choice.FinishReason
+				state.FinishReason = choice.FinishReason
 			}
-		}
-		if chunk.Usage != nil {
-			lastUsage = chunk.Usage
 		}
 	}
 
-	info.Content = contentBuilder.String()
-	// 将 map 转为 slice（按 key 排序）
-	if len(streamToolCalls) > 0 {
-		indices := make([]int, 0, len(streamToolCalls))
-		for k := range streamToolCalls {
-			indices = append(indices, k)
+	if len(choiceStates) > 0 {
+		choiceIndexes := make([]int, 0, len(choiceStates))
+		for idx := range choiceStates {
+			choiceIndexes = append(choiceIndexes, idx)
 		}
-		sort.Ints(indices)
-		for _, k := range indices {
-			toolCalls = append(toolCalls, *streamToolCalls[k])
+		sort.Ints(choiceIndexes)
+		for _, idx := range choiceIndexes {
+			state := choiceStates[idx]
+			appendTextSegment(&contentBuilder, state.Content.String())
+			appendTextSegment(&reasoningBuilder, state.Reasoning.String())
+			if state.FinishReason != "" {
+				info.FinishReason = state.FinishReason
+			}
+			if len(state.ToolCalls) > 0 {
+				toolIndexes := make([]int, 0, len(state.ToolCalls))
+				for k := range state.ToolCalls {
+					toolIndexes = append(toolIndexes, k)
+				}
+				sort.Ints(toolIndexes)
+				for _, k := range toolIndexes {
+					info.ToolCalls = append(info.ToolCalls, *state.ToolCalls[k])
+				}
+			}
 		}
 	}
-	info.ToolCalls = toolCalls
-	info.FinishReason = finishReason
+	info.Content = contentBuilder.String()
+	info.ReasoningContent = reasoningBuilder.String()
 	info.Usage = lastUsage
 }
 
@@ -1134,8 +1183,10 @@ func (info *responseInfo) extractOpenAIFromNonStream(body string) {
 	var resp struct {
 		Choices []struct {
 			Message struct {
-				Content   string         `json:"content"`
-				ToolCalls []toolCallInfo `json:"tool_calls"`
+				Content          string         `json:"content"`
+				ReasoningContent string         `json:"reasoning_content"`
+				Reasoning        string         `json:"reasoning"`
+				ToolCalls        []toolCallInfo `json:"tool_calls"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -1144,11 +1195,26 @@ func (info *responseInfo) extractOpenAIFromNonStream(body string) {
 	if err := json.Unmarshal([]byte(body), &resp); err != nil {
 		return
 	}
-	if len(resp.Choices) > 0 {
-		info.Content = resp.Choices[0].Message.Content
-		info.ToolCalls = resp.Choices[0].Message.ToolCalls
-		info.FinishReason = resp.Choices[0].FinishReason
+	var contentBuilder strings.Builder
+	var reasoningBuilder strings.Builder
+	for _, choice := range resp.Choices {
+		if choice.Message.Content != "" {
+			appendTextSegment(&contentBuilder, choice.Message.Content)
+		}
+		if choice.Message.ReasoningContent != "" {
+			appendTextSegment(&reasoningBuilder, choice.Message.ReasoningContent)
+		} else if choice.Message.Reasoning != "" {
+			appendTextSegment(&reasoningBuilder, choice.Message.Reasoning)
+		}
+		if len(choice.Message.ToolCalls) > 0 {
+			info.ToolCalls = append(info.ToolCalls, choice.Message.ToolCalls...)
+		}
+		if choice.FinishReason != "" {
+			info.FinishReason = choice.FinishReason
+		}
 	}
+	info.Content = contentBuilder.String()
+	info.ReasoningContent = reasoningBuilder.String()
 	info.Usage = resp.Usage
 }
 
@@ -1197,6 +1263,8 @@ func (info *responseInfo) extractAnthropicFromNonStream(body string) {
 
 func (info *responseInfo) extractAnthropicFromStream(body string) {
 	var contentBuilder strings.Builder
+	var reasoningBuilder strings.Builder
+	reasoningBlocks := make(map[int]string)
 	streamToolCalls := make(map[int]*toolCallInfo)
 	toolCallHasDelta := make(map[int]bool)
 	var finishReason string
@@ -1246,6 +1314,13 @@ func (info *responseInfo) extractAnthropicFromStream(body string) {
 				contentBuilder.WriteString(event.ContentBlock.Text)
 				continue
 			}
+			if event.ContentBlock.Type == "thinking" {
+				continue
+			}
+			if event.ContentBlock.Type == "redacted_thinking" {
+				reasoningBlocks[event.Index] = "[加密的思考过程，无法读取]"
+				continue
+			}
 			if event.ContentBlock.Type == "tool_use" {
 				tool := &toolCallInfo{ID: event.ContentBlock.ID, Type: event.ContentBlock.Type}
 				tool.Function.Name = event.ContentBlock.Name
@@ -1258,6 +1333,7 @@ func (info *responseInfo) extractAnthropicFromStream(body string) {
 				Delta struct {
 					Type        string `json:"type"`
 					Text        string `json:"text"`
+					Thinking    string `json:"thinking"`
 					PartialJSON string `json:"partial_json"`
 				} `json:"delta"`
 			}
@@ -1267,6 +1343,12 @@ func (info *responseInfo) extractAnthropicFromStream(body string) {
 			switch event.Delta.Type {
 			case "text_delta":
 				contentBuilder.WriteString(event.Delta.Text)
+			case "thinking_delta":
+				if event.Delta.Thinking != "" {
+					reasoningBlocks[event.Index] += event.Delta.Thinking
+				} else {
+					reasoningBlocks[event.Index] += event.Delta.Text
+				}
 			case "input_json_delta":
 				if _, ok := streamToolCalls[event.Index]; !ok {
 					streamToolCalls[event.Index] = &toolCallInfo{Type: "tool_use"}
@@ -1301,6 +1383,17 @@ func (info *responseInfo) extractAnthropicFromStream(body string) {
 	}
 
 	info.Content = contentBuilder.String()
+	if len(reasoningBlocks) > 0 {
+		indices := make([]int, 0, len(reasoningBlocks))
+		for idx := range reasoningBlocks {
+			indices = append(indices, idx)
+		}
+		sort.Ints(indices)
+		for _, idx := range indices {
+			appendTextSegment(&reasoningBuilder, reasoningBlocks[idx])
+		}
+	}
+	info.ReasoningContent = reasoningBuilder.String()
 	if len(streamToolCalls) > 0 {
 		indices := make([]int, 0, len(streamToolCalls))
 		for idx := range streamToolCalls {
