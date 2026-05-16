@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"flag"
 	"io"
 	"log/slog"
@@ -31,9 +33,69 @@ func TestBuildUpstreamURLByProvider(t *testing.T) {
 	}
 }
 
+func TestBuildRouteTargetsSupportsSingleProvider(t *testing.T) {
+	tests := []struct {
+		name         string
+		cfg          proxyConfig
+		wantPath     string
+		wantProvider string
+		wantUpstream string
+	}{
+		{
+			name: "openai only",
+			cfg: proxyConfig{
+				openaiUpstreamBaseURL: "https://api.openai.com/v1",
+				openaiAPIKey:          "openai-key",
+			},
+			wantPath:     "/v1/chat/completions",
+			wantProvider: providerOpenAI,
+			wantUpstream: "https://api.openai.com/v1/chat/completions",
+		},
+		{
+			name: "anthropic only",
+			cfg: proxyConfig{
+				anthropicUpstreamBaseURL: "https://api.anthropic.com",
+				anthropicAPIKey:          "anthropic-key",
+			},
+			wantPath:     "/v1/messages",
+			wantProvider: providerAnthropic,
+			wantUpstream: "https://api.anthropic.com/v1/messages",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			targets, err := buildRouteTargets(tt.cfg)
+			if err != nil {
+				t.Fatalf("build route targets: %v", err)
+			}
+			if len(targets) != 1 {
+				t.Fatalf("expected 1 route target, got %d", len(targets))
+			}
+			target, ok := targets[tt.wantPath]
+			if !ok {
+				t.Fatalf("missing target for path %s: %+v", tt.wantPath, targets)
+			}
+			if target.provider != tt.wantProvider {
+				t.Fatalf("unexpected provider: %s", target.provider)
+			}
+			if target.upstreamURL != tt.wantUpstream {
+				t.Fatalf("unexpected upstream url: %s", target.upstreamURL)
+			}
+		})
+	}
+}
+
 func TestNewProxyMuxRoutesAlwaysAvailable(t *testing.T) {
-	server := &proxyServer{routeTargets: map[string]upstreamTarget{}}
-	mux := newProxyMux(server)
+	cfg := proxyConfig{
+		healthzPath: "/healthz",
+	}
+	// 添加两个空的上游，让路由存在
+	server := &proxyServer{routeTargets: map[string]upstreamTarget{
+		"/v1/chat/completions": {provider: providerOpenAI},
+		"/v1/messages":         {provider: providerAnthropic},
+	}}
+	mux := newProxyMux(server, cfg)
 
 	resp := httptest.NewRecorder()
 	mux.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil))
@@ -51,6 +113,35 @@ func TestNewProxyMuxRoutesAlwaysAvailable(t *testing.T) {
 	mux.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/v1/unknown", nil))
 	if resp.Code != http.StatusNotFound {
 		t.Fatalf("unknown path should return 404, got %d", resp.Code)
+	}
+}
+
+func TestNewProxyMuxEnableCORS(t *testing.T) {
+	cfg := proxyConfig{
+		healthzPath: "/healthz",
+		enableCORS:  true,
+	}
+	server := &proxyServer{routeTargets: map[string]upstreamTarget{
+		"/v1/chat/completions": {provider: providerOpenAI},
+	}}
+	mux := newProxyMux(server, cfg)
+
+	preflight := httptest.NewRecorder()
+	mux.ServeHTTP(preflight, httptest.NewRequest(http.MethodOptions, "/v1/chat/completions", nil))
+	if preflight.Code != http.StatusNoContent {
+		t.Fatalf("expected preflight 204, got %d", preflight.Code)
+	}
+	if preflight.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("expected CORS allow origin header, got %q", preflight.Header().Get("Access-Control-Allow-Origin"))
+	}
+
+	healthz := httptest.NewRecorder()
+	mux.ServeHTTP(healthz, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if healthz.Code != http.StatusOK {
+		t.Fatalf("expected healthz 200, got %d", healthz.Code)
+	}
+	if healthz.Header().Get("Access-Control-Allow-Methods") == "" {
+		t.Fatalf("expected CORS allow methods header")
 	}
 }
 
@@ -113,7 +204,10 @@ func TestDualUpstreamProxyForwardsByPathAndAuthHeaders(t *testing.T) {
 		client: &http.Client{},
 		msgDir: tmpDir,
 	}
-	mux := newProxyMux(proxy)
+	cfg := proxyConfig{
+		healthzPath: "/healthz",
+	}
+	mux := newProxyMux(proxy, cfg)
 
 	openaiBody := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello-openai"}]}`
 	openaiReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(openaiBody))
@@ -228,6 +322,7 @@ func TestDualUpstreamProxyForwardsByPathAndAuthHeaders(t *testing.T) {
 }
 
 func TestParseFlagsRequiresDualUpstreamConfig(t *testing.T) {
+	// 测试同时配置两个上游，应该成功
 	cfg, err := runParseFlagsWithArgs(t, []string{
 		"--openai-upstream-base-url", "https://api.openai.com/v1",
 		"--openai-api-key", "openai-key",
@@ -241,22 +336,50 @@ func TestParseFlagsRequiresDualUpstreamConfig(t *testing.T) {
 		t.Fatalf("unexpected parsed api keys: %+v", cfg)
 	}
 
-	_, err = runParseFlagsWithArgs(t, []string{
+	// 测试只配置openai，应该成功
+	cfg, err = runParseFlagsWithArgs(t, []string{
 		"--openai-upstream-base-url", "https://api.openai.com/v1",
 		"--openai-api-key", "openai-key",
-		"--anthropic-upstream-base-url", "https://api.anthropic.com",
 	})
-	if err == nil || !strings.Contains(err.Error(), "--anthropic-api-key") {
-		t.Fatalf("expected missing anthropic api key error, got: %v", err)
+	if err != nil {
+		t.Fatalf("expected parseFlags success with only openai config: %v", err)
+	}
+	if cfg.openaiAPIKey != "openai-key" || cfg.anthropicAPIKey != "" {
+		t.Fatalf("unexpected parsed api keys for single openai config: %+v", cfg)
 	}
 
-	_, err = runParseFlagsWithArgs(t, []string{
-		"--openai-api-key", "openai-key",
+	// 测试只配置anthropic，应该成功
+	cfg, err = runParseFlagsWithArgs(t, []string{
 		"--anthropic-upstream-base-url", "https://api.anthropic.com",
 		"--anthropic-api-key", "anthropic-key",
 	})
-	if err == nil || !strings.Contains(err.Error(), "--openai-upstream-base-url") {
-		t.Fatalf("expected missing openai upstream base url error, got: %v", err)
+	if err != nil {
+		t.Fatalf("expected parseFlags success with only anthropic config: %v", err)
+	}
+	if cfg.anthropicAPIKey != "anthropic-key" || cfg.openaiAPIKey != "" {
+		t.Fatalf("unexpected parsed api keys for single anthropic config: %+v", cfg)
+	}
+
+	// 测试anthropic配置不完整且没有其他上游，应该失败
+	_, err = runParseFlagsWithArgs(t, []string{
+		"--anthropic-upstream-base-url", "https://api.anthropic.com",
+	})
+	if err == nil {
+		t.Fatalf("expected error when anthropic config is incomplete and no other upstream, got nil")
+	}
+
+	// 测试openai配置不完整且没有其他上游，应该失败
+	_, err = runParseFlagsWithArgs(t, []string{
+		"--openai-api-key", "openai-key",
+	})
+	if err == nil {
+		t.Fatalf("expected error when openai config is incomplete and no other upstream, got nil")
+	}
+
+	// 测试两个都不配置，应该失败
+	_, err = runParseFlagsWithArgs(t, []string{})
+	if err == nil || !strings.Contains(err.Error(), "at least one upstream") {
+		t.Fatalf("expected error when no upstream configured, got: %v", err)
 	}
 }
 
@@ -343,5 +466,90 @@ func TestExtractResponseInfoAnthropicStream(t *testing.T) {
 	}
 	if info.ToolCalls[0].Function.Arguments != `{"city":"Beijing"}` {
 		t.Fatalf("unexpected tool args: %s", info.ToolCalls[0].Function.Arguments)
+	}
+}
+
+type countingReadCloser struct {
+	io.ReadCloser
+	closeCalls int
+}
+
+func (c *countingReadCloser) Close() error {
+	c.closeCalls++
+	return c.ReadCloser.Close()
+}
+
+type countingCloser struct {
+	closeCalls int
+}
+
+func (c *countingCloser) Close() error {
+	c.closeCalls++
+	return nil
+}
+
+func TestDecompressRequestBodyCloseClosesRequestBody(t *testing.T) {
+	var gzipped bytes.Buffer
+	zw := gzip.NewWriter(&gzipped)
+	if _, err := zw.Write([]byte(`{"message":"hello"}`)); err != nil {
+		t.Fatalf("write gzip body: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close gzip writer: %v", err)
+	}
+
+	reqBody := &countingReadCloser{ReadCloser: io.NopCloser(bytes.NewReader(gzipped.Bytes()))}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Body = reqBody
+	req.Header.Set("Content-Encoding", "gzip")
+
+	bodyReader, err := decompressRequestBody(req, maxRequestBodySize)
+	if err != nil {
+		t.Fatalf("decompress request body: %v", err)
+	}
+
+	if _, err := io.ReadAll(bodyReader); err != nil {
+		t.Fatalf("read decompressed body: %v", err)
+	}
+	if err := bodyReader.Close(); err != nil {
+		t.Fatalf("close body reader: %v", err)
+	}
+	if reqBody.closeCalls != 1 {
+		t.Fatalf("expected request body to be closed once, got %d", reqBody.closeCalls)
+	}
+}
+
+func TestLimitedReadCloserCloseClosesAllClosers(t *testing.T) {
+	readerCloser := &countingCloser{}
+	bodyCloser := &countingCloser{}
+
+	bodyReader := newLimitedReadCloser(strings.NewReader("hello"), 5, readerCloser, bodyCloser)
+	if _, err := io.ReadAll(bodyReader); err != nil {
+		t.Fatalf("read body reader: %v", err)
+	}
+	if err := bodyReader.Close(); err != nil {
+		t.Fatalf("close body reader: %v", err)
+	}
+	if readerCloser.closeCalls != 1 {
+		t.Fatalf("expected reader closer to be called once, got %d", readerCloser.closeCalls)
+	}
+	if bodyCloser.closeCalls != 1 {
+		t.Fatalf("expected body closer to be called once, got %d", bodyCloser.closeCalls)
+	}
+}
+
+func TestCopyResponseBodyLimitsLoggedBuffer(t *testing.T) {
+	var dst bytes.Buffer
+	var logged strings.Builder
+
+	err := copyResponseBody(&dst, strings.NewReader("abcdefgh"), &logged, 5)
+	if err != nil {
+		t.Fatalf("copy response body: %v", err)
+	}
+	if dst.String() != "abcdefgh" {
+		t.Fatalf("unexpected copied response body: %q", dst.String())
+	}
+	if logged.String() != "abcde" {
+		t.Fatalf("unexpected logged response body: %q", logged.String())
 	}
 }
