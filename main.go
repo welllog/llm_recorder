@@ -1033,6 +1033,13 @@ func extractResponseInfo(body, provider string) responseInfo {
 		} else {
 			info.extractAnthropicFromNonStream(body)
 		}
+		if info.Content == "" && info.ReasoningContent == "" && len(info.ToolCalls) == 0 && info.Usage == nil {
+			if strings.HasPrefix(trimLeadingNoise(body), "data: ") {
+				info.extractOpenAIFromStream(body)
+			} else {
+				info.extractOpenAIFromNonStream(body)
+			}
+		}
 		return info
 	}
 
@@ -1041,6 +1048,13 @@ func extractResponseInfo(body, provider string) responseInfo {
 		info.extractOpenAIFromStream(body)
 	} else {
 		info.extractOpenAIFromNonStream(body)
+	}
+	if info.Content == "" && info.ReasoningContent == "" && len(info.ToolCalls) == 0 && info.Usage == nil {
+		if strings.Contains(body, "\nevent:") || strings.HasPrefix(trimLeadingNoise(body), "event:") {
+			info.extractAnthropicFromStream(body)
+		} else {
+			info.extractAnthropicFromNonStream(body)
+		}
 	}
 
 	return info
@@ -1365,6 +1379,7 @@ func (info *responseInfo) extractAnthropicFromStream(body string) {
 					StopReason string `json:"stop_reason"`
 				} `json:"delta"`
 				Usage struct {
+					InputTokens  int `json:"input_tokens"`
 					OutputTokens int `json:"output_tokens"`
 				} `json:"usage"`
 			}
@@ -1376,6 +1391,9 @@ func (info *responseInfo) extractAnthropicFromStream(body string) {
 			}
 			if usage == nil {
 				usage = &usageInfo{}
+			}
+			if event.Usage.InputTokens != 0 {
+				usage.PromptTokens = event.Usage.InputTokens
 			}
 			usage.CompletionTokens = event.Usage.OutputTokens
 			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens

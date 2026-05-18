@@ -553,6 +553,46 @@ func TestExtractResponseInfoAnthropicStreamThinking(t *testing.T) {
 	}
 }
 
+func TestExtractResponseInfoAnthropicStreamPromptTokensFromMessageDelta(t *testing.T) {
+	body := strings.Join([]string{
+		"event: content_block_start",
+		"data: {\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"Answer\"}}",
+		"",
+		"event: message_delta",
+		"data: {\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":9,\"output_tokens\":4}}",
+	}, "\n")
+
+	info := extractResponseInfo(body, providerAnthropic)
+	if info.Content != "Answer" {
+		t.Fatalf("unexpected content: %q", info.Content)
+	}
+	if info.FinishReason != "end_turn" {
+		t.Fatalf("unexpected finish reason: %s", info.FinishReason)
+	}
+	if info.Usage == nil || info.Usage.PromptTokens != 9 || info.Usage.CompletionTokens != 4 || info.Usage.TotalTokens != 13 {
+		t.Fatalf("unexpected usage: %+v", info.Usage)
+	}
+}
+
+func TestExtractResponseInfoAnthropicProviderFallsBackToOpenAIStream(t *testing.T) {
+	body := strings.Join([]string{
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}",
+		"data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":6,\"completion_tokens\":2,\"total_tokens\":8}}",
+		"data: [DONE]",
+	}, "\n")
+
+	info := extractResponseInfo(body, providerAnthropic)
+	if info.Content != "Hello" {
+		t.Fatalf("unexpected content: %q", info.Content)
+	}
+	if info.FinishReason != "stop" {
+		t.Fatalf("unexpected finish reason: %s", info.FinishReason)
+	}
+	if info.Usage == nil || info.Usage.PromptTokens != 6 || info.Usage.CompletionTokens != 2 || info.Usage.TotalTokens != 8 {
+		t.Fatalf("unexpected usage: %+v", info.Usage)
+	}
+}
+
 type countingReadCloser struct {
 	io.ReadCloser
 	closeCalls int

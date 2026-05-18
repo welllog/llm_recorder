@@ -3,3 +3,5 @@ messages
 *.log
 messages*
 prompt_*.md
+ref
+tmp_analysis
