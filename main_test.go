@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"flag"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -675,5 +676,50 @@ func TestCopyResponseBodyLimitsLoggedBuffer(t *testing.T) {
 	}
 	if logged.String() != "abcde" {
 		t.Fatalf("unexpected logged response body: %q", logged.String())
+	}
+}
+
+// failAfterWriter 写入 failAfter 字节后返回错误，模拟客户端中途断开
+type failAfterWriter struct {
+	buf       bytes.Buffer
+	failAfter int
+	written   int
+}
+
+func (w *failAfterWriter) Write(p []byte) (int, error) {
+	remaining := w.failAfter - w.written
+	if remaining <= 0 {
+		return 0, fmt.Errorf("broken pipe")
+	}
+	if len(p) > remaining {
+		n, _ := w.buf.Write(p[:remaining])
+		w.written += n
+		return n, fmt.Errorf("broken pipe")
+	}
+	n, _ := w.buf.Write(p)
+	w.written += n
+	return n, nil
+}
+
+func TestCopyResponseBodyContinuesAfterDstError(t *testing.T) {
+	// 模拟上游返回大量 SSE 数据，客户端在收到前 10 字节后断开
+	upstreamData := "data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\ndata: [DONE]\n\n"
+	dst := &failAfterWriter{failAfter: 10}
+	var logged strings.Builder
+
+	err := copyResponseBody(dst, strings.NewReader(upstreamData), &logged, 0)
+	if err == nil {
+		t.Fatal("expected error from broken dst, got nil")
+	}
+	if err.Error() != "broken pipe" {
+		t.Fatalf("expected broken pipe error, got: %v", err)
+	}
+	// 关键：buffer 应该包含完整的上游响应，即使 dst 写入失败
+	if logged.String() != upstreamData {
+		t.Fatalf("buffer should contain full upstream response even when dst fails\ngot:  %q\nwant: %q", logged.String(), upstreamData)
+	}
+	// dst 只收到了前 10 字节
+	if dst.buf.Len() != 10 {
+		t.Fatalf("dst should only have 10 bytes, got %d", dst.buf.Len())
 	}
 }

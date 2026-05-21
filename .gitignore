@@ -5,3 +5,5 @@ messages*
 prompt_*.md
 ref
 tmp_analysis
+.alma-snapshots
+.claude

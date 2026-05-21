@@ -556,11 +556,18 @@ func (s *proxyServer) handleProxyRequest(w http.ResponseWriter, r *http.Request,
 	}()
 
 	copyResponseHeaders(w.Header(), upstreamResp.Header)
+
+	// 如果上游返回压缩响应，解压后再转发，以便日志能正确解析
+	respBody, decompressed := decompressResponseBody(upstreamResp)
+	if decompressed {
+		w.Header().Del("Content-Encoding")
+		w.Header().Del("Content-Length")
+	}
 	w.WriteHeader(upstreamResp.StatusCode)
 
 	responseBuffer := &strings.Builder{}
 	writer := &flushWriter{w: w}
-	copyErr := copyResponseBody(writer, upstreamResp.Body, responseBuffer, s.maxResponseSize)
+	copyErr := copyResponseBody(writer, respBody, responseBuffer, s.maxResponseSize)
 	if copyErr != nil && !errors.Is(copyErr, context.Canceled) {
 		s.logExchange(exchangeLog{
 			RequestID:       requestID,
@@ -987,10 +994,12 @@ func extractToolsFromAnthropicRequest(req anthropicRequest) string {
 type responseInfo struct {
 	Content          string // 模型返回的正式文本内容
 	ReasoningContent string // 模型的思考过程（OpenAI的reasoning_content、Anthropic的thinking）
+	Refusal          string // OpenAI 的 refusal 字段（内容审核拒绝时返回）
 	ToolCalls        []toolCallInfo
 	FinishReason     string
 	Usage            *usageInfo
 	RawContent       string // 原始响应文本（用于保存到文件）
+	ParseError       string // 解析失败时的诊断信息
 }
 
 type usageInfo struct {
@@ -1002,6 +1011,7 @@ type usageInfo struct {
 type openAIChoiceState struct {
 	Content      strings.Builder
 	Reasoning    strings.Builder
+	Refusal      strings.Builder
 	FinishReason string
 	ToolCalls    map[int]*toolCallInfo
 }
@@ -1026,6 +1036,11 @@ func trimLeadingNoise(s string) string {
 func extractResponseInfo(body, provider string) responseInfo {
 	info := responseInfo{RawContent: body}
 
+	if body == "" {
+		info.ParseError = "response body is empty"
+		return info
+	}
+
 	if provider == providerAnthropic {
 		trimmed := trimLeadingNoise(body)
 		if strings.Contains(body, "\nevent:") || strings.HasPrefix(trimmed, "event:") {
@@ -1033,12 +1048,15 @@ func extractResponseInfo(body, provider string) responseInfo {
 		} else {
 			info.extractAnthropicFromNonStream(body)
 		}
-		if info.Content == "" && info.ReasoningContent == "" && len(info.ToolCalls) == 0 && info.Usage == nil {
+		if info.Content == "" && info.ReasoningContent == "" && len(info.ToolCalls) == 0 && info.Usage == nil && info.Refusal == "" {
 			if strings.HasPrefix(trimLeadingNoise(body), "data: ") {
 				info.extractOpenAIFromStream(body)
 			} else {
 				info.extractOpenAIFromNonStream(body)
 			}
+		}
+		if info.Content == "" && info.ReasoningContent == "" && len(info.ToolCalls) == 0 && info.Usage == nil && info.Refusal == "" {
+			info.ParseError = fmt.Sprintf("failed to parse as anthropic or openai format, body preview: %s", truncateString(body, 200))
 		}
 		return info
 	}
@@ -1049,12 +1067,15 @@ func extractResponseInfo(body, provider string) responseInfo {
 	} else {
 		info.extractOpenAIFromNonStream(body)
 	}
-	if info.Content == "" && info.ReasoningContent == "" && len(info.ToolCalls) == 0 && info.Usage == nil {
+	if info.Content == "" && info.ReasoningContent == "" && len(info.ToolCalls) == 0 && info.Usage == nil && info.Refusal == "" {
 		if strings.Contains(body, "\nevent:") || strings.HasPrefix(trimLeadingNoise(body), "event:") {
 			info.extractAnthropicFromStream(body)
 		} else {
 			info.extractAnthropicFromNonStream(body)
 		}
+	}
+	if info.Content == "" && info.ReasoningContent == "" && len(info.ToolCalls) == 0 && info.Usage == nil && info.Refusal == "" {
+		info.ParseError = fmt.Sprintf("failed to parse as openai or anthropic format, body preview: %s", truncateString(body, 200))
 	}
 
 	return info
@@ -1097,6 +1118,7 @@ func (info *responseInfo) extractOpenAIFromStream(body string) {
 					Content          string                `json:"content"`
 					ReasoningContent string                `json:"reasoning_content"`
 					Reasoning        string                `json:"reasoning"`
+					Refusal          string                `json:"refusal"`
 					ToolCalls        []streamToolCallDelta `json:"tool_calls"`
 				} `json:"delta"`
 				FinishReason string `json:"finish_reason"`
@@ -1124,6 +1146,9 @@ func (info *responseInfo) extractOpenAIFromStream(body string) {
 				state.Reasoning.WriteString(choice.Delta.ReasoningContent)
 			} else if choice.Delta.Reasoning != "" {
 				state.Reasoning.WriteString(choice.Delta.Reasoning)
+			}
+			if choice.Delta.Refusal != "" {
+				state.Refusal.WriteString(choice.Delta.Refusal)
 			}
 			// 合并流式 tool_calls（每个 chunk 只包含部分信息）
 			for _, tc := range choice.Delta.ToolCalls {
@@ -1162,6 +1187,7 @@ func (info *responseInfo) extractOpenAIFromStream(body string) {
 		}
 	}
 
+	var refusalBuilder strings.Builder
 	if len(choiceStates) > 0 {
 		choiceIndexes := make([]int, 0, len(choiceStates))
 		for idx := range choiceStates {
@@ -1172,6 +1198,9 @@ func (info *responseInfo) extractOpenAIFromStream(body string) {
 			state := choiceStates[idx]
 			appendTextSegment(&contentBuilder, state.Content.String())
 			appendTextSegment(&reasoningBuilder, state.Reasoning.String())
+			if state.Refusal.Len() > 0 {
+				appendTextSegment(&refusalBuilder, state.Refusal.String())
+			}
 			if state.FinishReason != "" {
 				info.FinishReason = state.FinishReason
 			}
@@ -1189,6 +1218,7 @@ func (info *responseInfo) extractOpenAIFromStream(body string) {
 	}
 	info.Content = contentBuilder.String()
 	info.ReasoningContent = reasoningBuilder.String()
+	info.Refusal = refusalBuilder.String()
 	info.Usage = lastUsage
 }
 
@@ -1200,6 +1230,7 @@ func (info *responseInfo) extractOpenAIFromNonStream(body string) {
 				Content          string         `json:"content"`
 				ReasoningContent string         `json:"reasoning_content"`
 				Reasoning        string         `json:"reasoning"`
+				Refusal          string         `json:"refusal"`
 				ToolCalls        []toolCallInfo `json:"tool_calls"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
@@ -1219,6 +1250,9 @@ func (info *responseInfo) extractOpenAIFromNonStream(body string) {
 			appendTextSegment(&reasoningBuilder, choice.Message.ReasoningContent)
 		} else if choice.Message.Reasoning != "" {
 			appendTextSegment(&reasoningBuilder, choice.Message.Reasoning)
+		}
+		if choice.Message.Refusal != "" {
+			info.Refusal = choice.Message.Refusal
 		}
 		if len(choice.Message.ToolCalls) > 0 {
 			info.ToolCalls = append(info.ToolCalls, choice.Message.ToolCalls...)
@@ -1428,7 +1462,7 @@ func (info *responseInfo) extractAnthropicFromStream(body string) {
 
 // formatResponseContent 格式化响应内容为可读文本
 func formatResponseContent(info responseInfo) string {
-	if info.Content == "" && info.ReasoningContent == "" && len(info.ToolCalls) == 0 && info.Usage == nil {
+	if info.Content == "" && info.ReasoningContent == "" && info.Refusal == "" && len(info.ToolCalls) == 0 && info.Usage == nil {
 		return ""
 	}
 
@@ -1464,9 +1498,24 @@ func formatResponseContent(info responseInfo) string {
 		}
 	}
 
+	// 内容审核拒绝
+	if info.Refusal != "" {
+		if info.Content != "" || info.ReasoningContent != "" {
+			sb.WriteString("│\n")
+		}
+		sb.WriteString("│ 🚫 REFUSAL:\n")
+		for _, line := range strings.Split(strings.TrimSpace(info.Refusal), "\n") {
+			if line == "" {
+				sb.WriteString("│\n")
+				continue
+			}
+			sb.WriteString(fmt.Sprintf("│   %s\n", line))
+		}
+	}
+
 	// 工具调用
 	if len(info.ToolCalls) > 0 {
-		if info.Content != "" {
+		if info.Content != "" || info.Refusal != "" {
 			sb.WriteString("│\n")
 		}
 		sb.WriteString("│   🔧 TOOL CALLS:\n")
@@ -1543,6 +1592,16 @@ func (s *proxyServer) logExchange(entry exchangeLog, provider string) {
 		}
 		if responseContent != "" {
 			attrs = append(attrs, slog.String("responseContent", truncateString(responseContent, s.maxLogFieldSize)))
+		} else if entry.StatusCode == 200 && entry.Error == "" {
+			// DEBUG: 响应解析为空时记录原始响应体
+			attrs = append(attrs, slog.Int("responseBodyLen", len(entry.ResponseBody)))
+			attrs = append(attrs, slog.String("responseBodyPreview", truncateString(entry.ResponseBody, 500)))
+		}
+		if responseInfo.ParseError != "" {
+			attrs = append(attrs, slog.String("parseError", responseInfo.ParseError))
+		}
+		if responseInfo.Refusal != "" {
+			attrs = append(attrs, slog.String("refusal", truncateString(responseInfo.Refusal, s.maxLogFieldSize)))
 		}
 	} else {
 		attrs = append(attrs, slog.String("logging", "full content logging disabled for security"))
@@ -1630,6 +1689,9 @@ func (s *proxyServer) saveMessageToFile(reqID uint64, provider, requestPath, mod
 		content.WriteString(fmt.Sprintf("║ 📊 Tokens:     prompt=%d, completion=%d, total=%d\n",
 			respInfo.Usage.PromptTokens, respInfo.Usage.CompletionTokens, respInfo.Usage.TotalTokens))
 	}
+	if respInfo.Refusal != "" {
+		content.WriteString(fmt.Sprintf("║ 🚫 Refusal:    %s\n", truncateString(respInfo.Refusal, 200)))
+	}
 	if len(respInfo.ToolCalls) > 0 {
 		content.WriteString(fmt.Sprintf("║ 🔧 Tool Calls: %d\n", len(respInfo.ToolCalls)))
 		for i, tc := range respInfo.ToolCalls {
@@ -1638,6 +1700,9 @@ func (s *proxyServer) saveMessageToFile(reqID uint64, provider, requestPath, mod
 	}
 	if toolCount > 0 {
 		content.WriteString(fmt.Sprintf("║ 🛠️  Tools:      %d defined\n", toolCount))
+	}
+	if respInfo.ParseError != "" {
+		content.WriteString(fmt.Sprintf("║ ⚠️  Parse Error: %s\n", respInfo.ParseError))
 	}
 	content.WriteString("╚══════════════════════════════════════════════════════════════════════════════════════════════════\n\n")
 
@@ -1707,6 +1772,8 @@ func isHopByHopHeader(key string) bool {
 
 func copyResponseBody(dst io.Writer, src io.Reader, buf *strings.Builder, maxLogBytes int) error {
 	data := make([]byte, 32*1024)
+	var dstErr error
+	dstBroken := false
 	for {
 		n, err := src.Read(data)
 		if n > 0 {
@@ -1724,17 +1791,20 @@ func copyResponseBody(dst io.Writer, src io.Reader, buf *strings.Builder, maxLog
 					}
 				}
 			}
-			written, writeErr := dst.Write(chunk)
-			if writeErr != nil {
-				return writeErr
-			}
-			if written != len(chunk) {
-				return io.ErrShortWrite
+			if !dstBroken {
+				written, writeErr := dst.Write(chunk)
+				if writeErr != nil {
+					dstErr = writeErr
+					dstBroken = true
+				} else if written != len(chunk) {
+					dstErr = io.ErrShortWrite
+					dstBroken = true
+				}
 			}
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil
+				return dstErr
 			}
 			return err
 		}
@@ -1762,6 +1832,23 @@ func (l *limitedReadCloser) Close() error {
 		err = errors.Join(err, closer.Close())
 	}
 	return err
+}
+
+// decompressResponseBody 解压gzip/deflate压缩的响应体，以便日志正确记录
+func decompressResponseBody(resp *http.Response) (io.ReadCloser, bool) {
+	encoding := strings.ToLower(resp.Header.Get("Content-Encoding"))
+	switch encoding {
+	case "gzip":
+		gr, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return resp.Body, false
+		}
+		return gr, true
+	case "deflate":
+		return flate.NewReader(resp.Body), true
+	default:
+		return resp.Body, false
+	}
 }
 
 // decompressRequestBody 解压gzip/deflate压缩的请求体，防止zip bomb
