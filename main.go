@@ -28,22 +28,24 @@ import (
 )
 
 type proxyConfig struct {
-	listenAddr                 string
-	openaiUpstreamBaseURL      string
-	openaiAPIKey               string
-	anthropicUpstreamBaseURL   string
-	anthropicAPIKey            string
-	logFile                    string
-	logFormat                  string
-	msgDir                     string
-	timeout                    time.Duration
-	maxResponseSize            int
-	disableFullLogging         bool
-	enableCORS                 bool
-	maxLogFieldSize            int
-	enableRequestDecompression bool
-	createDateSubdirs          bool
-	healthzPath                string
+	listenAddr                       string
+	openaiUpstreamBaseURL            string
+	openaiAPIKey                     string
+	openaiResponsesUpstreamBaseURL   string
+	openaiResponsesAPIKey            string
+	anthropicUpstreamBaseURL         string
+	anthropicAPIKey                  string
+	logFile                          string
+	logFormat                        string
+	msgDir                           string
+	timeout                          time.Duration
+	maxResponseSize                  int
+	disableFullLogging               bool
+	enableCORS                       bool
+	maxLogFieldSize                  int
+	enableRequestDecompression       bool
+	createDateSubdirs                bool
+	healthzPath                      string
 }
 
 type upstreamTarget struct {
@@ -87,8 +89,9 @@ type exchangeLog struct {
 const maxRequestBodySize = 50 << 20
 
 const (
-	providerOpenAI    = "openai"
-	providerAnthropic = "anthropic"
+	providerOpenAI          = "openai"
+	providerAnthropic       = "anthropic"
+	providerOpenAIResponses = "openai-responses"
 )
 
 func main() {
@@ -194,6 +197,7 @@ func main() {
 		"proxy server starting",
 		"listenAddr", cfg.listenAddr,
 		"openaiEnabled", routeTargets["/v1/chat/completions"].upstreamURL != "",
+		"openaiResponsesEnabled", routeTargets["/v1/responses"].upstreamURL != "",
 		"anthropicEnabled", routeTargets["/v1/messages"].upstreamURL != "",
 		"logFile", cfg.logFile,
 	)
@@ -208,6 +212,8 @@ func parseFlags() (proxyConfig, error) {
 	flag.StringVar(&cfg.listenAddr, "listen", ":8080", "listen address for the proxy server")
 	flag.StringVar(&cfg.openaiUpstreamBaseURL, "openai-upstream-base-url", "", "OpenAI upstream base URL, e.g. https://api.openai.com/v1")
 	flag.StringVar(&cfg.openaiAPIKey, "openai-api-key", "", "OpenAI upstream API key")
+	flag.StringVar(&cfg.openaiResponsesUpstreamBaseURL, "openai-responses-upstream-base-url", "", "OpenAI Responses API upstream base URL (falls back to openai-upstream-base-url if empty)")
+	flag.StringVar(&cfg.openaiResponsesAPIKey, "openai-responses-api-key", "", "OpenAI Responses API key (falls back to openai-api-key if empty)")
 	flag.StringVar(&cfg.anthropicUpstreamBaseURL, "anthropic-upstream-base-url", "", "Anthropic upstream base URL, e.g. https://api.anthropic.com")
 	flag.StringVar(&cfg.anthropicAPIKey, "anthropic-api-key", "", "Anthropic upstream API key")
 	flag.StringVar(&cfg.logFile, "log-file", "llm_proxy.log", "log file path in the current directory")
@@ -227,6 +233,8 @@ func parseFlags() (proxyConfig, error) {
 	cfg.listenAddr = strings.TrimSpace(cfg.listenAddr)
 	cfg.openaiUpstreamBaseURL = strings.TrimSpace(cfg.openaiUpstreamBaseURL)
 	cfg.openaiAPIKey = strings.TrimSpace(cfg.openaiAPIKey)
+	cfg.openaiResponsesUpstreamBaseURL = strings.TrimSpace(cfg.openaiResponsesUpstreamBaseURL)
+	cfg.openaiResponsesAPIKey = strings.TrimSpace(cfg.openaiResponsesAPIKey)
 	cfg.anthropicUpstreamBaseURL = strings.TrimSpace(cfg.anthropicUpstreamBaseURL)
 	cfg.anthropicAPIKey = strings.TrimSpace(cfg.anthropicAPIKey)
 	cfg.logFile = strings.TrimSpace(cfg.logFile)
@@ -240,6 +248,12 @@ func parseFlags() (proxyConfig, error) {
 	}
 	if cfg.openaiAPIKey == "" {
 		cfg.openaiAPIKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+	}
+	if cfg.openaiResponsesUpstreamBaseURL == "" {
+		cfg.openaiResponsesUpstreamBaseURL = strings.TrimSpace(os.Getenv("OPENAI_RESPONSES_UPSTREAM_BASE_URL"))
+	}
+	if cfg.openaiResponsesAPIKey == "" {
+		cfg.openaiResponsesAPIKey = strings.TrimSpace(os.Getenv("OPENAI_RESPONSES_API_KEY"))
 	}
 	if cfg.anthropicUpstreamBaseURL == "" {
 		cfg.anthropicUpstreamBaseURL = strings.TrimSpace(os.Getenv("ANTHROPIC_UPSTREAM_BASE_URL"))
@@ -340,6 +354,8 @@ func buildUpstreamURL(baseURL, provider string) (string, error) {
 	targetPath := "chat/completions"
 	if provider == providerAnthropic {
 		targetPath = "v1/messages"
+	} else if provider == providerOpenAIResponses {
+		targetPath = "responses"
 	}
 	// 检查是否已经包含目标路径，避免重复添加
 	parsed, err := url.Parse(trimmed)
@@ -358,7 +374,7 @@ func buildUpstreamURL(baseURL, provider string) (string, error) {
 }
 
 func buildRouteTargets(cfg proxyConfig) (map[string]upstreamTarget, error) {
-	targets := make(map[string]upstreamTarget, 2)
+	targets := make(map[string]upstreamTarget, 3)
 
 	if cfg.openaiUpstreamBaseURL != "" && cfg.openaiAPIKey != "" {
 		upstreamURL, err := buildUpstreamURL(cfg.openaiUpstreamBaseURL, providerOpenAI)
@@ -369,6 +385,27 @@ func buildRouteTargets(cfg proxyConfig) (map[string]upstreamTarget, error) {
 			provider:    providerOpenAI,
 			upstreamURL: upstreamURL,
 			apiKey:      cfg.openaiAPIKey,
+		}
+	}
+
+	// Responses API: 使用独立配置，未配置时 fallback 到 OpenAI 配置
+	responsesBaseURL := cfg.openaiResponsesUpstreamBaseURL
+	if responsesBaseURL == "" {
+		responsesBaseURL = cfg.openaiUpstreamBaseURL
+	}
+	responsesAPIKey := cfg.openaiResponsesAPIKey
+	if responsesAPIKey == "" {
+		responsesAPIKey = cfg.openaiAPIKey
+	}
+	if responsesBaseURL != "" && responsesAPIKey != "" {
+		responsesUpstreamURL, err := buildUpstreamURL(responsesBaseURL, providerOpenAIResponses)
+		if err != nil {
+			return nil, fmt.Errorf("openai-responses upstream: %w", err)
+		}
+		targets["/v1/responses"] = upstreamTarget{
+			provider:    providerOpenAIResponses,
+			upstreamURL: responsesUpstreamURL,
+			apiKey:      responsesAPIKey,
 		}
 	}
 
@@ -403,6 +440,9 @@ func newProxyMux(server *proxyServer, cfg proxyConfig) http.Handler {
 	if _, ok := server.routeTargets["/v1/messages"]; ok {
 		mux.HandleFunc("/v1/messages", server.handleMessages)
 	}
+	if _, ok := server.routeTargets["/v1/responses"]; ok {
+		mux.HandleFunc("/v1/responses", server.handleResponses)
+	}
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
@@ -436,6 +476,10 @@ func (s *proxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 
 func (s *proxyServer) handleMessages(w http.ResponseWriter, r *http.Request) {
 	s.handleProxyRequest(w, r, "/v1/messages")
+}
+
+func (s *proxyServer) handleResponses(w http.ResponseWriter, r *http.Request) {
+	s.handleProxyRequest(w, r, "/v1/responses")
 }
 
 func (s *proxyServer) handleProxyRequest(w http.ResponseWriter, r *http.Request, expectedPath string) {
@@ -620,6 +664,14 @@ type toolDef struct {
 // toolFuncDef 描述工具函数的名称、描述和参数 schema
 type toolFuncDef struct {
 	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Parameters  any    `json:"parameters,omitempty"`
+}
+
+// responsesToolDef 描述 OpenAI Responses API 中的工具定义（扁平结构）
+type responsesToolDef struct {
+	Type        string `json:"type"`
+	Name        string `json:"name,omitempty"`
 	Description string `json:"description,omitempty"`
 	Parameters  any    `json:"parameters,omitempty"`
 }
@@ -990,6 +1042,189 @@ func extractToolsFromAnthropicRequest(req anthropicRequest) string {
 	return sb.String()
 }
 
+// responsesInputItem 描述 OpenAI Responses API 输入项
+type responsesInputItem struct {
+	Type      string                 `json:"type"`
+	Role      string                 `json:"role,omitempty"`
+	Content   []responsesContentPart `json:"content,omitempty"`
+	CallID    string                 `json:"call_id,omitempty"`
+	Output    string                 `json:"output,omitempty"`
+	Name      string                 `json:"name,omitempty"`
+	Arguments string                 `json:"arguments,omitempty"`
+}
+
+// responsesContentPart 描述 Responses API 输入内容块
+type responsesContentPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
+}
+
+// responsesRequest 用于解析 OpenAI Responses API 请求体
+type responsesRequest struct {
+	Model        string             `json:"model"`
+	Input        json.RawMessage    `json:"input"`
+	Instructions string             `json:"instructions,omitempty"`
+	Tools        []responsesToolDef `json:"tools,omitempty"`
+	Stream       bool               `json:"stream,omitempty"`
+}
+
+func parseResponsesRequest(body string) responsesRequest {
+	var req responsesRequest
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		return responsesRequest{}
+	}
+	return req
+}
+
+func extractMessagesFromResponsesRequest(req responsesRequest) string {
+	if len(req.Input) == 0 && req.Instructions == "" {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("┌──────────────────────────────────────────────────────────────────────────────────────────────────\n")
+	sb.WriteString("│ 💬 PROMPT DETAILS\n")
+	sb.WriteString("├──────────────────────────────────────────────────────────────────────────────────────────────────\n")
+
+	if req.Instructions != "" {
+		sb.WriteString("│ ⚙️  INSTRUCTIONS\n")
+		for _, line := range strings.Split(strings.TrimSpace(req.Instructions), "\n") {
+			if strings.TrimSpace(line) == "" {
+				sb.WriteString("│\n")
+				continue
+			}
+			sb.WriteString(fmt.Sprintf("│   %s\n", line))
+		}
+		sb.WriteString("│\n")
+	}
+
+	trimmed := strings.TrimSpace(string(req.Input))
+	if trimmed == "" || trimmed == "null" {
+		sb.WriteString("└──────────────────────────────────────────────────────────────────────────────────────────────────")
+		return sb.String()
+	}
+
+	var inputStr string
+	if err := json.Unmarshal(req.Input, &inputStr); err == nil {
+		sb.WriteString("│ 👤 USER\n")
+		for _, line := range strings.Split(strings.TrimSpace(inputStr), "\n") {
+			if line == "" {
+				sb.WriteString("│\n")
+				continue
+			}
+			sb.WriteString(fmt.Sprintf("│   %s\n", line))
+		}
+	} else {
+		var items []responsesInputItem
+		if err := json.Unmarshal(req.Input, &items); err != nil {
+			sb.WriteString(fmt.Sprintf("│ [unparseable input: %s]\n", truncateString(trimmed, 200)))
+		} else {
+			for i, item := range items {
+				switch item.Type {
+				case "message":
+					icon := "👤"
+					switch strings.ToLower(item.Role) {
+					case "system", "developer":
+						icon = "⚙️ "
+					case "assistant":
+						icon = "🤖"
+					}
+					sb.WriteString(fmt.Sprintf("│ %s %-15s\n", icon, strings.ToUpper(item.Role)))
+					for _, part := range item.Content {
+						switch part.Type {
+						case "input_text", "output_text":
+							for _, line := range strings.Split(strings.TrimSpace(part.Text), "\n") {
+								if line == "" {
+									sb.WriteString("│\n")
+									continue
+								}
+								sb.WriteString(fmt.Sprintf("│   %s\n", line))
+							}
+						case "input_image":
+							sb.WriteString(fmt.Sprintf("│   [image] url: %s\n", part.ImageURL))
+						default:
+							sb.WriteString(fmt.Sprintf("│   [%s]\n", part.Type))
+						}
+					}
+				case "function_call_output":
+					sb.WriteString(fmt.Sprintf("│ 🛠️  FUNCTION CALL OUTPUT (call_id: %s)\n", item.CallID))
+					for _, line := range strings.Split(strings.TrimSpace(item.Output), "\n") {
+						if line == "" {
+							sb.WriteString("│\n")
+							continue
+						}
+						sb.WriteString(fmt.Sprintf("│   %s\n", line))
+					}
+				case "function_call":
+					sb.WriteString(fmt.Sprintf("│ 🔧 FUNCTION CALL: %s (call_id: %s)\n", item.Name, item.CallID))
+					var argsPretty string
+					var argsMap map[string]any
+					if err := json.Unmarshal([]byte(item.Arguments), &argsMap); err == nil {
+						if pretty, err := json.MarshalIndent(argsMap, "│     ", "  "); err == nil {
+							argsPretty = string(pretty)
+						}
+					}
+					if argsPretty == "" {
+						argsPretty = item.Arguments
+					}
+					for _, line := range strings.Split(argsPretty, "\n") {
+						sb.WriteString(fmt.Sprintf("│     %s\n", line))
+					}
+				}
+				if i < len(items)-1 {
+					sb.WriteString("│\n")
+				}
+			}
+		}
+	}
+
+	sb.WriteString("└──────────────────────────────────────────────────────────────────────────────────────────────────")
+	return sb.String()
+}
+
+func extractToolsFromResponsesRequest(req responsesRequest) string {
+	if len(req.Tools) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("┌──────────────────────────────────────────────────────────────────────────────────────────────────\n")
+	sb.WriteString("│ 🔧 TOOL DEFINITIONS\n")
+	sb.WriteString("├──────────────────────────────────────────────────────────────────────────────────────────────────\n")
+
+	for i, tool := range req.Tools {
+		name := tool.Name
+		if name == "" {
+			name = tool.Type
+		}
+		sb.WriteString(fmt.Sprintf("│ 📌 Tool #%d: %s (type: %s)\n", i+1, name, tool.Type))
+		if tool.Description != "" {
+			descLines := strings.Split(strings.TrimSpace(tool.Description), "\n")
+			sb.WriteString("│   📝 Description:\n")
+			for _, line := range descLines {
+				sb.WriteString(fmt.Sprintf("│     %s\n", line))
+			}
+		}
+		if tool.Parameters != nil {
+			sb.WriteString("│   📋 Parameters:\n")
+			var paramsPretty string
+			if pretty, err := json.MarshalIndent(tool.Parameters, "│     ", "  "); err == nil {
+				paramsPretty = string(pretty)
+			}
+			if paramsPretty != "" {
+				for _, line := range strings.Split(paramsPretty, "\n") {
+					sb.WriteString(fmt.Sprintf("│     %s\n", line))
+				}
+			}
+		}
+		if i < len(req.Tools)-1 {
+			sb.WriteString("│\n")
+		}
+	}
+
+	sb.WriteString("└──────────────────────────────────────────────────────────────────────────────────────────────────")
+	return sb.String()
+}
+
 // responseInfo 保存从响应中提取的结构化信息
 type responseInfo struct {
 	Content          string // 模型返回的正式文本内容
@@ -1038,6 +1273,19 @@ func extractResponseInfo(body, provider string) responseInfo {
 
 	if body == "" {
 		info.ParseError = "response body is empty"
+		return info
+	}
+
+	if provider == providerOpenAIResponses {
+		trimmed := trimLeadingNoise(body)
+		if strings.Contains(body, "\nevent:") || strings.HasPrefix(trimmed, "event:") {
+			info.extractResponsesFromStream(body)
+		} else {
+			info.extractResponsesFromNonStream(body)
+		}
+		if info.Content == "" && len(info.ToolCalls) == 0 && info.Usage == nil {
+			info.ParseError = fmt.Sprintf("failed to parse responses format, body preview: %s", truncateString(body, 200))
+		}
 		return info
 	}
 
@@ -1264,6 +1512,198 @@ func (info *responseInfo) extractOpenAIFromNonStream(body string) {
 	info.Content = contentBuilder.String()
 	info.ReasoningContent = reasoningBuilder.String()
 	info.Usage = resp.Usage
+}
+
+// responsesOutputItem 描述 OpenAI Responses API 输出项
+type responsesOutputItem struct {
+	Type      string `json:"type"`
+	ID        string `json:"id,omitempty"`
+	Role      string `json:"role,omitempty"`
+	Status    string `json:"status,omitempty"`
+	CallID    string `json:"call_id,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+	Content   []struct {
+		Type string `json:"type"`
+		Text string `json:"text,omitempty"`
+	} `json:"content,omitempty"`
+}
+
+func (info *responseInfo) extractResponsesFromNonStream(body string) {
+	var resp struct {
+		Output []responsesOutputItem `json:"output"`
+		Status string                `json:"status"`
+		Usage  *struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		return
+	}
+
+	var contentBuilder strings.Builder
+	for _, item := range resp.Output {
+		switch item.Type {
+		case "message":
+			for _, part := range item.Content {
+				if part.Type == "output_text" {
+					appendTextSegment(&contentBuilder, part.Text)
+				}
+			}
+			if item.Status != "" {
+				info.FinishReason = item.Status
+			}
+		case "function_call":
+			tool := toolCallInfo{
+				ID:   item.CallID,
+				Type: "function",
+			}
+			tool.Function.Name = item.Name
+			tool.Function.Arguments = item.Arguments
+			info.ToolCalls = append(info.ToolCalls, tool)
+		}
+	}
+	info.Content = contentBuilder.String()
+	if resp.Status != "" {
+		info.FinishReason = resp.Status
+	}
+	if resp.Usage != nil {
+		info.Usage = &usageInfo{
+			PromptTokens:     resp.Usage.InputTokens,
+			CompletionTokens: resp.Usage.OutputTokens,
+			TotalTokens:      resp.Usage.InputTokens + resp.Usage.OutputTokens,
+		}
+	}
+}
+
+func (info *responseInfo) extractResponsesFromStream(body string) {
+	var contentBuilder strings.Builder
+	streamToolCalls := make(map[string]*toolCallInfo)
+	itemIDToCallID := make(map[string]string)
+	var finishReason string
+	var usage *usageInfo
+	currentEvent := ""
+
+	lines := strings.Split(body, "\n")
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			currentEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+
+		switch currentEvent {
+		case "response.output_text.delta":
+			var event struct {
+				Delta string `json:"delta"`
+			}
+			if err := json.Unmarshal([]byte(data), &event); err == nil {
+				contentBuilder.WriteString(event.Delta)
+			}
+
+		case "response.function_call_arguments.delta":
+			var event struct {
+				ItemID     string `json:"item_id"`
+				CallID     string `json:"call_id"`
+				Delta      string `json:"delta"`
+				PartialJSON string `json:"partial_json"`
+			}
+			if err := json.Unmarshal([]byte(data), &event); err == nil {
+				key := event.CallID
+				if key == "" {
+					key = event.ItemID
+				}
+				if mapped, ok := itemIDToCallID[key]; ok {
+					key = mapped
+				}
+				delta := event.Delta
+				if delta == "" {
+					delta = event.PartialJSON
+				}
+				if existing, ok := streamToolCalls[key]; ok {
+					existing.Function.Arguments += delta
+				} else {
+					tc := &toolCallInfo{
+						ID:   key,
+						Type: "function",
+					}
+					tc.Function.Arguments = delta
+					streamToolCalls[key] = tc
+				}
+			}
+
+		case "response.output_item.added":
+			var event struct {
+				Item responsesOutputItem `json:"item"`
+			}
+			if err := json.Unmarshal([]byte(data), &event); err == nil {
+				if event.Item.Type == "function_call" {
+					key := event.Item.CallID
+					if key == "" {
+						key = event.Item.ID
+					}
+					tc := &toolCallInfo{
+						ID:   key,
+						Type: "function",
+					}
+					tc.Function.Name = event.Item.Name
+					streamToolCalls[key] = tc
+					if event.Item.ID != "" && event.Item.CallID != "" {
+						itemIDToCallID[event.Item.ID] = event.Item.CallID
+					}
+				}
+			}
+
+		case "response.completed":
+			var event struct {
+				Response struct {
+					Status string                `json:"status"`
+					Output []responsesOutputItem  `json:"output"`
+					Usage  *struct {
+						InputTokens  int `json:"input_tokens"`
+						OutputTokens int `json:"output_tokens"`
+					} `json:"usage"`
+				} `json:"response"`
+			}
+			if err := json.Unmarshal([]byte(data), &event); err == nil {
+				if event.Response.Status != "" {
+					finishReason = event.Response.Status
+				}
+				if event.Response.Usage != nil {
+					usage = &usageInfo{
+						PromptTokens:     event.Response.Usage.InputTokens,
+						CompletionTokens: event.Response.Usage.OutputTokens,
+						TotalTokens:      event.Response.Usage.InputTokens + event.Response.Usage.OutputTokens,
+					}
+				}
+			}
+		}
+	}
+
+	info.Content = contentBuilder.String()
+	if len(streamToolCalls) > 0 {
+		keys := make([]string, 0, len(streamToolCalls))
+		for k := range streamToolCalls {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			info.ToolCalls = append(info.ToolCalls, *streamToolCalls[k])
+		}
+	}
+	info.FinishReason = finishReason
+	info.Usage = usage
 }
 
 func (info *responseInfo) extractAnthropicFromNonStream(body string) {
@@ -1609,7 +2049,7 @@ func (s *proxyServer) logExchange(entry exchangeLog, provider string) {
 
 	// 将消息保存到单独的文件中
 	if s.msgDir != "" && !s.disableFullLogging {
-		s.saveMessageToFile(entry.RequestID, provider, entry.Path, model, toolCount, tools, messages, responseContent, responseInfo)
+		s.saveMessageToFile(entry.RequestID, provider, entry.Path, entry.UpstreamURL, model, toolCount, tools, messages, responseContent, responseInfo)
 	}
 
 	// 详细信息放在最后
@@ -1642,6 +2082,10 @@ func (s *proxyServer) logExchange(entry exchangeLog, provider string) {
 }
 
 func extractRequestInfo(body, provider string) (model, messages, tools string, toolCount int) {
+	if provider == providerOpenAIResponses {
+		req := parseResponsesRequest(body)
+		return req.Model, extractMessagesFromResponsesRequest(req), extractToolsFromResponsesRequest(req), len(req.Tools)
+	}
 	if provider == providerAnthropic {
 		req := parseAnthropicRequest(body)
 		return req.Model, extractMessagesFromAnthropicRequest(req), extractToolsFromAnthropicRequest(req), len(req.Tools)
@@ -1651,7 +2095,7 @@ func extractRequestInfo(body, provider string) (model, messages, tools string, t
 	return req.Model, extractMessagesFromRequest(req), extractToolsFromRequest(req), len(req.Tools)
 }
 
-func (s *proxyServer) saveMessageToFile(reqID uint64, provider, requestPath, model string, toolCount int, tools, messages, response string, respInfo responseInfo) {
+func (s *proxyServer) saveMessageToFile(reqID uint64, provider, requestPath, upstreamURL, model string, toolCount int, tools, messages, response string, respInfo responseInfo) {
 	now := time.Now()
 	timestamp := now.Format("20060102_150405")
 	// 文件名包含model，方便搜索
@@ -1659,20 +2103,26 @@ func (s *proxyServer) saveMessageToFile(reqID uint64, provider, requestPath, mod
 	filename := fmt.Sprintf("%s_%s_%04d_%s.txt", timestamp, provider, reqID, safeModel)
 
 	var filePath string
+	providerDir := filepath.Join(s.msgDir, provider)
 	if s.createDateSubdirs {
 		// 按年月/年月日创建子目录
 		monthDir := now.Format("200601")
 		dayDir := now.Format("20060102")
-		fullDir := filepath.Join(s.msgDir, monthDir, dayDir)
+		fullDir := filepath.Join(providerDir, monthDir, dayDir)
 		if err := os.MkdirAll(fullDir, 0o700); err != nil {
 			s.logger.Error("failed to create date subdirectory", "path", fullDir, "error", err)
-			// 降级到根目录
-			filePath = filepath.Join(s.msgDir, filename)
+			// 降级到provider目录
+			filePath = filepath.Join(providerDir, filename)
 		} else {
 			filePath = filepath.Join(fullDir, filename)
 		}
 	} else {
-		filePath = filepath.Join(s.msgDir, filename)
+		if err := os.MkdirAll(providerDir, 0o700); err != nil {
+			s.logger.Error("failed to create provider directory", "path", providerDir, "error", err)
+			filePath = filepath.Join(s.msgDir, filename)
+		} else {
+			filePath = filepath.Join(providerDir, filename)
+		}
 	}
 
 	var content strings.Builder
@@ -1681,6 +2131,9 @@ func (s *proxyServer) saveMessageToFile(reqID uint64, provider, requestPath, mod
 	content.WriteString(fmt.Sprintf("║ ⏰ Timestamp:  %s\n", time.Now().Format(time.RFC3339)))
 	content.WriteString(fmt.Sprintf("║ 🧭 Provider:   %s\n", provider))
 	content.WriteString(fmt.Sprintf("║ 🛣️  Path:       %s\n", requestPath))
+	if upstreamURL != "" {
+		content.WriteString(fmt.Sprintf("║ 🔗 Upstream:   %s\n", upstreamURL))
+	}
 	content.WriteString(fmt.Sprintf("║ 🧠 Model:      %s\n", model))
 	if respInfo.FinishReason != "" {
 		content.WriteString(fmt.Sprintf("║ 🏁 Finish:     %s\n", respInfo.FinishReason))

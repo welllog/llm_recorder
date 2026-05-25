@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -41,6 +42,7 @@ func TestBuildRouteTargetsSupportsSingleProvider(t *testing.T) {
 		wantPath     string
 		wantProvider string
 		wantUpstream string
+		wantCount    int
 	}{
 		{
 			name: "openai only",
@@ -51,6 +53,7 @@ func TestBuildRouteTargetsSupportsSingleProvider(t *testing.T) {
 			wantPath:     "/v1/chat/completions",
 			wantProvider: providerOpenAI,
 			wantUpstream: "https://api.openai.com/v1/chat/completions",
+			wantCount:    2, // chat/completions + responses
 		},
 		{
 			name: "anthropic only",
@@ -61,6 +64,7 @@ func TestBuildRouteTargetsSupportsSingleProvider(t *testing.T) {
 			wantPath:     "/v1/messages",
 			wantProvider: providerAnthropic,
 			wantUpstream: "https://api.anthropic.com/v1/messages",
+			wantCount:    1,
 		},
 	}
 
@@ -70,8 +74,8 @@ func TestBuildRouteTargetsSupportsSingleProvider(t *testing.T) {
 			if err != nil {
 				t.Fatalf("build route targets: %v", err)
 			}
-			if len(targets) != 1 {
-				t.Fatalf("expected 1 route target, got %d", len(targets))
+			if len(targets) != tt.wantCount {
+				t.Fatalf("expected %d route target(s), got %d", tt.wantCount, len(targets))
 			}
 			target, ok := targets[tt.wantPath]
 			if !ok {
@@ -263,38 +267,39 @@ func TestDualUpstreamProxyForwardsByPathAndAuthHeaders(t *testing.T) {
 		t.Fatalf("read msg dir: %v", err)
 	}
 	if len(entries) != 2 {
-		t.Fatalf("expected 2 message files, got %d", len(entries))
+		t.Fatalf("expected 2 provider subdirs, got %d", len(entries))
 	}
 
-	var names []string
+	var providerDirs []string
 	for _, entry := range entries {
-		names = append(names, entry.Name())
+		providerDirs = append(providerDirs, entry.Name())
 	}
-	sort.Strings(names)
+	sort.Strings(providerDirs)
 
-	if !strings.Contains(names[0], "_anthropic_") && !strings.Contains(names[1], "_anthropic_") {
-		t.Fatalf("expected anthropic message file in names: %v", names)
-	}
-	if !strings.Contains(names[0], "_openai_") && !strings.Contains(names[1], "_openai_") {
-		t.Fatalf("expected openai message file in names: %v", names)
+	if providerDirs[0] != "anthropic" || providerDirs[1] != "openai" {
+		t.Fatalf("expected provider subdirs [anthropic, openai], got: %v", providerDirs)
 	}
 
-	var openaiFile string
-	var anthropicFile string
-	for _, name := range names {
-		if strings.Contains(name, "_openai_") {
-			openaiFile = filepath.Join(tmpDir, name)
-		}
-		if strings.Contains(name, "_anthropic_") {
-			anthropicFile = filepath.Join(tmpDir, name)
-		}
+	openaiFiles, err := os.ReadDir(filepath.Join(tmpDir, "openai"))
+	if err != nil {
+		t.Fatalf("read openai dir: %v", err)
+	}
+	if len(openaiFiles) != 1 {
+		t.Fatalf("expected 1 openai message file, got %d", len(openaiFiles))
+	}
+	anthropicFiles, err := os.ReadDir(filepath.Join(tmpDir, "anthropic"))
+	if err != nil {
+		t.Fatalf("read anthropic dir: %v", err)
+	}
+	if len(anthropicFiles) != 1 {
+		t.Fatalf("expected 1 anthropic message file, got %d", len(anthropicFiles))
 	}
 
-	openaiContentBytes, err := os.ReadFile(openaiFile)
+	openaiContentBytes, err := os.ReadFile(filepath.Join(tmpDir, "openai", openaiFiles[0].Name()))
 	if err != nil {
 		t.Fatalf("read openai message file: %v", err)
 	}
-	anthropicContentBytes, err := os.ReadFile(anthropicFile)
+	anthropicContentBytes, err := os.ReadFile(filepath.Join(tmpDir, "anthropic", anthropicFiles[0].Name()))
 	if err != nil {
 		t.Fatalf("read anthropic message file: %v", err)
 	}
@@ -722,4 +727,344 @@ func TestCopyResponseBodyContinuesAfterDstError(t *testing.T) {
 	if dst.buf.Len() != 10 {
 		t.Fatalf("dst should only have 10 bytes, got %d", dst.buf.Len())
 	}
+}
+
+func TestBuildUpstreamURLByProviderResponses(t *testing.T) {
+responsesURL, err := buildUpstreamURL("https://api.openai.com/v1", providerOpenAIResponses)
+	if err != nil {
+		t.Fatalf("build responses upstream url: %v", err)
+	}
+	if responsesURL != "https://api.openai.com/v1/responses" {
+		t.Fatalf("unexpected responses upstream url: %s", responsesURL)
+	}
+}
+
+func TestBuildRouteTargetsIncludesResponses(t *testing.T) {
+	cfg := proxyConfig{
+		openaiUpstreamBaseURL: "https://api.openai.com/v1",
+		openaiAPIKey:          "openai-key",
+	}
+	targets, err := buildRouteTargets(cfg)
+	if err != nil {
+		t.Fatalf("build route targets: %v", err)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("expected 2 route targets (chat/completions + responses), got %d", len(targets))
+	}
+	respTarget, ok := targets["/v1/responses"]
+	if !ok {
+		t.Fatal("missing /v1/responses target")
+	}
+	if respTarget.provider != providerOpenAIResponses {
+		t.Fatalf("unexpected provider: %s", respTarget.provider)
+	}
+	if respTarget.upstreamURL != "https://api.openai.com/v1/responses" {
+		t.Fatalf("unexpected upstream url: %s", respTarget.upstreamURL)
+	}
+	if respTarget.apiKey != "openai-key" {
+		t.Fatalf("unexpected api key: %s", respTarget.apiKey)
+	}
+}
+
+func TestBuildRouteTargetsResponsesIndependentConfig(t *testing.T) {
+	cfg := proxyConfig{
+		openaiUpstreamBaseURL:          "https://api.openai.com/v1",
+		openaiAPIKey:                   "openai-key",
+		openaiResponsesUpstreamBaseURL: "https://responses.example.com/v1",
+		openaiResponsesAPIKey:          "responses-key",
+	}
+	targets, err := buildRouteTargets(cfg)
+	if err != nil {
+		t.Fatalf("build route targets: %v", err)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("expected 2 route targets, got %d", len(targets))
+	}
+
+	chatTarget := targets["/v1/chat/completions"]
+	if chatTarget.upstreamURL != "https://api.openai.com/v1/chat/completions" {
+		t.Fatalf("unexpected chat upstream: %s", chatTarget.upstreamURL)
+	}
+	if chatTarget.apiKey != "openai-key" {
+		t.Fatalf("unexpected chat api key: %s", chatTarget.apiKey)
+	}
+
+	respTarget := targets["/v1/responses"]
+	if respTarget.upstreamURL != "https://responses.example.com/v1/responses" {
+		t.Fatalf("unexpected responses upstream: %s", respTarget.upstreamURL)
+	}
+	if respTarget.apiKey != "responses-key" {
+		t.Fatalf("unexpected responses api key: %s", respTarget.apiKey)
+	}
+}
+
+func TestBuildRouteTargetsResponsesOnly(t *testing.T) {
+	cfg := proxyConfig{
+		openaiResponsesUpstreamBaseURL: "https://responses.example.com/v1",
+		openaiResponsesAPIKey:          "responses-key",
+	}
+	targets, err := buildRouteTargets(cfg)
+	if err != nil {
+		t.Fatalf("build route targets: %v", err)
+	}
+	if len(targets) != 1 {
+		t.Fatalf("expected 1 route target, got %d", len(targets))
+	}
+	respTarget, ok := targets["/v1/responses"]
+	if !ok {
+		t.Fatal("missing /v1/responses target")
+	}
+	if respTarget.upstreamURL != "https://responses.example.com/v1/responses" {
+		t.Fatalf("unexpected upstream: %s", respTarget.upstreamURL)
+	}
+}
+
+func TestNewProxyMuxRoutesResponses(t *testing.T) {
+	cfg := proxyConfig{
+		healthzPath: "/healthz",
+	}
+	server := &proxyServer{routeTargets: map[string]upstreamTarget{
+		"/v1/chat/completions": {provider: providerOpenAI},
+		"/v1/messages":         {provider: providerAnthropic},
+		"/v1/responses":        {provider: providerOpenAIResponses},
+	}}
+	mux := newProxyMux(server, cfg)
+
+	resp := httptest.NewRecorder()
+	mux.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	if resp.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("/v1/responses should exist and reject GET with 405, got %d", resp.Code)
+	}
+}
+
+func TestExtractResponseInfoResponsesNonStream(t *testing.T) {
+	body := `{"id":"resp_123","object":"response","status":"completed","model":"gpt-4o","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hello world"}]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"Beijing\"}"}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`
+	info := extractResponseInfo(body, providerOpenAIResponses)
+
+	if info.Content != "Hello world" {
+		t.Fatalf("unexpected content: %q", info.Content)
+	}
+	if info.FinishReason != "completed" {
+		t.Fatalf("unexpected finish reason: %s", info.FinishReason)
+	}
+	if info.Usage == nil || info.Usage.PromptTokens != 10 || info.Usage.CompletionTokens != 5 || info.Usage.TotalTokens != 15 {
+		t.Fatalf("unexpected usage: %+v", info.Usage)
+	}
+	if len(info.ToolCalls) != 1 {
+		t.Fatalf("unexpected tool call count: %d", len(info.ToolCalls))
+	}
+	if info.ToolCalls[0].ID != "call_1" || info.ToolCalls[0].Function.Name != "get_weather" {
+		t.Fatalf("unexpected tool call: %+v", info.ToolCalls[0])
+	}
+	if strings.TrimSpace(info.ToolCalls[0].Function.Arguments) != `{"city":"Beijing"}` {
+		t.Fatalf("unexpected tool args: %s", info.ToolCalls[0].Function.Arguments)
+	}
+}
+
+func TestExtractResponseInfoResponsesStream(t *testing.T) {
+	body := strings.Join([]string{
+		"event: response.created",
+		`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+		"",
+		"event: response.output_item.added",
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[]}}`,
+		"",
+		"event: response.content_part.added",
+		`data: {"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}`,
+		"",
+		"event: response.output_text.delta",
+		`data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Hello"}`,
+		"",
+		"event: response.output_text.delta",
+		`data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":" world"}`,
+		"",
+		"event: response.output_text.done",
+		`data: {"type":"response.output_text.done","output_index":0,"content_index":0,"text":"Hello world"}`,
+		"",
+		"event: response.completed",
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}`,
+	}, "\n")
+
+	info := extractResponseInfo(body, providerOpenAIResponses)
+	if info.Content != "Hello world" {
+		t.Fatalf("unexpected content: %q", info.Content)
+	}
+	if info.FinishReason != "completed" {
+		t.Fatalf("unexpected finish reason: %s", info.FinishReason)
+	}
+	if info.Usage == nil || info.Usage.PromptTokens != 10 || info.Usage.CompletionTokens != 5 || info.Usage.TotalTokens != 15 {
+		t.Fatalf("unexpected usage: %+v", info.Usage)
+	}
+}
+
+func TestExtractResponseInfoResponsesStreamWithToolCalls(t *testing.T) {
+	body := strings.Join([]string{
+		"event: response.output_item.added",
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":""}}`,
+		"",
+		"event: response.function_call_arguments.delta",
+		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"content_index":0,"partial_json":"{\"lo"}`,
+		"",
+		"event: response.function_call_arguments.delta",
+		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"content_index":0,"partial_json":"cation\":\"SF\"}"}`,
+		"",
+		"event: response.completed",
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}`,
+	}, "\n")
+
+	info := extractResponseInfo(body, providerOpenAIResponses)
+	if len(info.ToolCalls) != 1 {
+		t.Fatalf("unexpected tool call count: %d", len(info.ToolCalls))
+	}
+	if info.ToolCalls[0].ID != "call_1" {
+		t.Fatalf("unexpected tool call ID: %s", info.ToolCalls[0].ID)
+	}
+	if info.ToolCalls[0].Function.Name != "get_weather" {
+		t.Fatalf("unexpected tool name: %s", info.ToolCalls[0].Function.Name)
+	}
+	if info.ToolCalls[0].Function.Arguments != `{"location":"SF"}` {
+		t.Fatalf("unexpected tool args: %s", info.ToolCalls[0].Function.Arguments)
+	}
+	if info.FinishReason != "completed" {
+		t.Fatalf("unexpected finish reason: %s", info.FinishReason)
+	}
+	if info.Usage == nil || info.Usage.PromptTokens != 5 || info.Usage.CompletionTokens != 3 {
+		t.Fatalf("unexpected usage: %+v", info.Usage)
+	}
+}
+
+func TestDualUpstreamProxyForwardsResponsesEndpoint(t *testing.T) {
+	var receivedPath string
+	var receivedAuth string
+	var receivedAPIKey string
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		receivedAuth = r.Header.Get("Authorization")
+		receivedAPIKey = r.Header.Get("X-Api-Key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}`)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := buildUpstreamURL(upstream.URL, providerOpenAIResponses)
+	if err != nil {
+		t.Fatalf("build responses upstream url: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+
+	proxy := &proxyServer{
+		routeTargets: map[string]upstreamTarget{
+			"/v1/responses": {
+				provider:    providerOpenAIResponses,
+				upstreamURL: upstreamURL,
+				apiKey:      "responses-proxy-key",
+			},
+		},
+		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		client:  &http.Client{},
+		msgDir:  tmpDir,
+		nextID:  atomic.Uint64{},
+	}
+	cfg := proxyConfig{
+		healthzPath: "/healthz",
+	}
+	mux := newProxyMux(proxy, cfg)
+
+	body := `{"model":"gpt-4o","input":"hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Api-Key", "client-x-api-key")
+	resp := httptest.NewRecorder()
+	mux.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", resp.Code)
+	}
+	if receivedPath != "/responses" {
+		t.Fatalf("unexpected upstream path: %s", receivedPath)
+	}
+	if receivedAuth != "Bearer responses-proxy-key" {
+		t.Fatalf("proxy should inject Authorization, got: %s", receivedAuth)
+	}
+	if receivedAPIKey != "" {
+		t.Fatalf("upstream should not include X-Api-Key, got: %s", receivedAPIKey)
+	}
+
+	entries, err := os.ReadDir(filepath.Join(tmpDir, "openai-responses"))
+	if err != nil {
+		t.Fatalf("read provider dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 message file, got %d", len(entries))
+	}
+
+	contentBytes, err := os.ReadFile(filepath.Join(tmpDir, "openai-responses", entries[0].Name()))
+	if err != nil {
+		t.Fatalf("read message file: %v", err)
+	}
+	content := string(contentBytes)
+	if !strings.Contains(content, "Provider:   openai-responses") {
+		t.Fatalf("file should include provider marker, content: %s", content)
+	}
+	if !strings.Contains(content, "Finish:     completed") {
+		t.Fatalf("file should include finish reason, content: %s", content)
+	}
+}
+
+func TestParseResponsesRequest(t *testing.T) {
+	t.Run("string input", func(t *testing.T) {
+		body := `{"model":"gpt-4o","input":"What is 2+2?","instructions":"You are a math tutor."}`
+		req := parseResponsesRequest(body)
+		if req.Model != "gpt-4o" {
+			t.Fatalf("unexpected model: %s", req.Model)
+		}
+		if req.Instructions != "You are a math tutor." {
+			t.Fatalf("unexpected instructions: %s", req.Instructions)
+		}
+		msgs := extractMessagesFromResponsesRequest(req)
+		if !strings.Contains(msgs, "INSTRUCTIONS") {
+			t.Fatalf("messages should contain instructions section: %s", msgs)
+		}
+		if !strings.Contains(msgs, "What is 2+2?") {
+			t.Fatalf("messages should contain input text: %s", msgs)
+		}
+	})
+
+	t.Run("array input", func(t *testing.T) {
+		body := `{"model":"gpt-4o","input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"Be helpful."}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"Hi"}]}]}`
+		req := parseResponsesRequest(body)
+		if req.Model != "gpt-4o" {
+			t.Fatalf("unexpected model: %s", req.Model)
+		}
+		msgs := extractMessagesFromResponsesRequest(req)
+		if !strings.Contains(msgs, "DEVELOPER") {
+			t.Fatalf("messages should contain developer role: %s", msgs)
+		}
+		if !strings.Contains(msgs, "Be helpful.") {
+			t.Fatalf("messages should contain developer text: %s", msgs)
+		}
+		if !strings.Contains(msgs, "Hi") {
+			t.Fatalf("messages should contain user text: %s", msgs)
+		}
+	})
+
+	t.Run("with tools", func(t *testing.T) {
+		body := `{"model":"gpt-4o","input":"test","tools":[{"type":"function","name":"lookup","description":"Search","parameters":{"type":"object"}},{"type":"web_search"},{"type":"image_generation"}]}`
+		req := parseResponsesRequest(body)
+		tools := extractToolsFromResponsesRequest(req)
+		if !strings.Contains(tools, "lookup") {
+			t.Fatalf("tools should contain function name: %s", tools)
+		}
+		if !strings.Contains(tools, "Search") {
+			t.Fatalf("tools should contain description: %s", tools)
+		}
+		if !strings.Contains(tools, "web_search") {
+			t.Fatalf("tools should contain web_search type: %s", tools)
+		}
+		if !strings.Contains(tools, "image_generation") {
+			t.Fatalf("tools should contain image_generation type: %s", tools)
+		}
+	})
 }
