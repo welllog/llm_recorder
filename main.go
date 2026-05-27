@@ -1262,9 +1262,21 @@ func appendTextSegment(builder *strings.Builder, segment string) {
 }
 
 func trimLeadingNoise(s string) string {
-	return strings.TrimLeftFunc(s, func(r rune) bool {
-		return unicode.IsSpace(r) || r == '\ufeff'
-	})
+	// \u8df3\u8fc7\u524d\u5bfc\u7a7a\u767d\u3001BOM \u548c SSE \u6ce8\u91ca\u884c\uff08\u4ee5 : \u5f00\u5934\u7684\u884c\uff09
+	for {
+		s = strings.TrimLeftFunc(s, func(r rune) bool {
+			return unicode.IsSpace(r) || r == '\ufeff'
+		})
+		if !strings.HasPrefix(s, ":") {
+			return s
+		}
+		// \u8df3\u8fc7\u6574\u4e2a SSE \u6ce8\u91ca\u884c
+		if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+			s = s[idx+1:]
+		} else {
+			return ""
+		}
+	}
 }
 
 // extractResponseInfo 从响应body中提取模型返回的完整信息，包括工具调用、token用量等
