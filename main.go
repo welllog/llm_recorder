@@ -1238,9 +1238,11 @@ type responseInfo struct {
 }
 
 type usageInfo struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens             int `json:"prompt_tokens"`
+	CompletionTokens         int `json:"completion_tokens"`
+	TotalTokens              int `json:"total_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
 }
 
 type openAIChoiceState struct {
@@ -1723,8 +1725,10 @@ func (info *responseInfo) extractAnthropicFromNonStream(body string) {
 		Content    []anthropicContentBlock `json:"content"`
 		StopReason string                  `json:"stop_reason"`
 		Usage      *struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
+			InputTokens               int `json:"input_tokens"`
+			OutputTokens              int `json:"output_tokens"`
+			CreationCacheInputTokens  int `json:"cache_creation_input_tokens"`
+			ReadCacheInputTokens      int `json:"cache_read_input_tokens"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal([]byte(body), &resp); err != nil {
@@ -1754,9 +1758,11 @@ func (info *responseInfo) extractAnthropicFromNonStream(body string) {
 	info.FinishReason = resp.StopReason
 	if resp.Usage != nil {
 		info.Usage = &usageInfo{
-			PromptTokens:     resp.Usage.InputTokens,
-			CompletionTokens: resp.Usage.OutputTokens,
-			TotalTokens:      resp.Usage.InputTokens + resp.Usage.OutputTokens,
+			PromptTokens:             resp.Usage.InputTokens,
+			CompletionTokens:         resp.Usage.OutputTokens,
+			TotalTokens:              resp.Usage.InputTokens + resp.Usage.OutputTokens,
+			CacheCreationInputTokens: resp.Usage.CreationCacheInputTokens,
+			CacheReadInputTokens:     resp.Usage.ReadCacheInputTokens,
 		}
 	}
 }
@@ -1795,12 +1801,18 @@ func (info *responseInfo) extractAnthropicFromStream(body string) {
 			var event struct {
 				Message struct {
 					Usage struct {
-						InputTokens int `json:"input_tokens"`
+						InputTokens              int `json:"input_tokens"`
+						CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+						CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 					} `json:"usage"`
 				} `json:"message"`
 			}
 			if err := json.Unmarshal([]byte(data), &event); err == nil {
-				usage = &usageInfo{PromptTokens: event.Message.Usage.InputTokens}
+				usage = &usageInfo{
+					PromptTokens:             event.Message.Usage.InputTokens,
+					CacheCreationInputTokens: event.Message.Usage.CacheCreationInputTokens,
+					CacheReadInputTokens:     event.Message.Usage.CacheReadInputTokens,
+				}
 			}
 		case "content_block_start":
 			var event struct {
@@ -1865,8 +1877,10 @@ func (info *responseInfo) extractAnthropicFromStream(body string) {
 					StopReason string `json:"stop_reason"`
 				} `json:"delta"`
 				Usage struct {
-					InputTokens  int `json:"input_tokens"`
-					OutputTokens int `json:"output_tokens"`
+					InputTokens              int `json:"input_tokens"`
+					OutputTokens             int `json:"output_tokens"`
+					CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+					CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 				} `json:"usage"`
 			}
 			if err := json.Unmarshal([]byte(data), &event); err != nil {
@@ -1883,6 +1897,12 @@ func (info *responseInfo) extractAnthropicFromStream(body string) {
 			}
 			usage.CompletionTokens = event.Usage.OutputTokens
 			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+			if event.Usage.CacheCreationInputTokens != 0 {
+				usage.CacheCreationInputTokens = event.Usage.CacheCreationInputTokens
+			}
+			if event.Usage.CacheReadInputTokens != 0 {
+				usage.CacheReadInputTokens = event.Usage.CacheReadInputTokens
+			}
 		}
 	}
 
@@ -2011,6 +2031,16 @@ func formatResponseContent(info responseInfo) string {
 		sb.WriteString(fmt.Sprintf("│      Prompt Tokens:     %d\n", info.Usage.PromptTokens))
 		sb.WriteString(fmt.Sprintf("│      Completion Tokens: %d\n", info.Usage.CompletionTokens))
 		sb.WriteString(fmt.Sprintf("│      Total Tokens:      %d\n", info.Usage.TotalTokens))
+		if info.Usage.CacheCreationInputTokens > 0 || info.Usage.CacheReadInputTokens > 0 {
+			sb.WriteString("│\n")
+			sb.WriteString("│   🗄️  Cache Details:\n")
+			if info.Usage.CacheCreationInputTokens > 0 {
+				sb.WriteString(fmt.Sprintf("│      Cache Created:     %d tokens\n", info.Usage.CacheCreationInputTokens))
+			}
+			if info.Usage.CacheReadInputTokens > 0 {
+				sb.WriteString(fmt.Sprintf("│      Cache Read:        %d tokens\n", info.Usage.CacheReadInputTokens))
+			}
+		}
 	}
 
 	sb.WriteString("└──────────────────────────────────────────────────────────────────────────────────────────────────")
@@ -2153,6 +2183,14 @@ func (s *proxyServer) saveMessageToFile(reqID uint64, provider, requestPath, ups
 	if respInfo.Usage != nil {
 		content.WriteString(fmt.Sprintf("║ 📊 Tokens:     prompt=%d, completion=%d, total=%d\n",
 			respInfo.Usage.PromptTokens, respInfo.Usage.CompletionTokens, respInfo.Usage.TotalTokens))
+		if respInfo.Usage.CacheCreationInputTokens > 0 || respInfo.Usage.CacheReadInputTokens > 0 {
+			if respInfo.Usage.CacheCreationInputTokens > 0 {
+				content.WriteString(fmt.Sprintf("║ 🗄️  Cache:      created=%d tokens\n", respInfo.Usage.CacheCreationInputTokens))
+			}
+			if respInfo.Usage.CacheReadInputTokens > 0 {
+				content.WriteString(fmt.Sprintf("║ 🗄️  Cache:      read=%d tokens\n", respInfo.Usage.CacheReadInputTokens))
+			}
+		}
 	}
 	if respInfo.Refusal != "" {
 		content.WriteString(fmt.Sprintf("║ 🚫 Refusal:    %s\n", truncateString(respInfo.Refusal, 200)))
